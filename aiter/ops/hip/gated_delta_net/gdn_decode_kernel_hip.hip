@@ -7661,6 +7661,8 @@ void launch_gdn_decode_iasm_generic(
         dispatch_iasm_generic<2,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
     else if (num_k_heads == 8 && num_v_heads == 16)
         dispatch_iasm_generic<8,16>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 16 && num_v_heads == 48)
+        dispatch_iasm_generic<16,48>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
 }
 
 extern "C"

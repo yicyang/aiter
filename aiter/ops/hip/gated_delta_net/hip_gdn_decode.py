@@ -22,6 +22,14 @@ import torch
 
 _ext = None
 
+# (num_k_heads, num_v_heads) pairs dispatched by launch_gdn_decode_iasm{,_generic};
+# any other pair would launch no kernel and leave the output uninitialized.
+SUPPORTED_HEADS = {(16, 32), (2, 4), (4, 8), (2, 8), (8, 16), (16, 48)}
+
+
+def _gpu_arch() -> str:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+
 
 def _load_extension():
     global _ext
@@ -31,6 +39,9 @@ def _load_extension():
     import os
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
+    # torch's cpp_extension adds an --offload-arch per PYTORCH_ROCM_ARCH entry; the
+    # inline-asm kernels only assemble for CDNA, so build for the current GPU only.
+    os.environ["PYTORCH_ROCM_ARCH"] = _gpu_arch()
     _ext = load(
         name="hip_gdn_decode_ext",
         sources=[
@@ -39,7 +50,7 @@ def _load_extension():
             os.path.join(src_dir, "gdn_state_transpose_kernel_hip.hip"),
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--offload-arch=gfx942", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
         verbose=False,
     )
     return _ext
@@ -75,6 +86,12 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     V = v.shape[3]
 
+    if (H, HV) not in SUPPORTED_HEADS:
+        raise ValueError(
+            f"HIP GDN decode does not support num_k_heads={H}, num_v_heads={HV}; "
+            f"supported: {sorted(SUPPORTED_HEADS)}"
+        )
+
     if scale is None:
         scale = K ** -0.5
 
@@ -102,7 +119,7 @@ def hip_fused_sigmoid_gating_delta_rule_update(
         a.contiguous(),
         b.contiguous(),
         dt_bias_bf16,
-        A_log.contiguous(),
+        A_log.float().contiguous(),  # kernel reads A_log as float*
         indices_int32,
         initial_state_source,
         o,
