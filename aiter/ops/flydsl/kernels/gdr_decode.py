@@ -262,10 +262,14 @@ def create_vk_gdr_decode_kernel(
                             sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
                         )
                     sum_q_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_q_partial_vec
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_q_partial_vec),
                     ).dest
                     sum_k_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_k_partial_vec
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_k_partial_vec),
                     ).dest
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_q_partial = (
@@ -317,7 +321,9 @@ def create_vk_gdr_decode_kernel(
                         sk_vecs[ki], sq_vecs[ki], dot_kq_vec
                     ).result
                 dot_kq = mlir_vector.ReductionOp(
-                    T.f32, vector.CombiningKind.ADD, dot_kq_vec
+                    T.f32,
+                    mlir_vector.CombiningKind.ADD,
+                    _to_raw(dot_kq_vec),
                 ).dest
                 for offset in WARP_THREADS_K_SHFL_OFFSETS:
                     dot_kq = (
@@ -346,10 +352,14 @@ def create_vk_gdr_decode_kernel(
                         sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
 
                     sum_hk = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hk
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_hk),
                     ).dest
                     sum_hq_old = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hq_old
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_hq_old),
                     ).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
