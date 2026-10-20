@@ -45,6 +45,8 @@ def create_vk_gdr_decode_kernel(
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
+    qkv_strides: tuple | None = None,
+    min_valid_index: int = 0,
 ):
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
@@ -133,14 +135,26 @@ def create_vk_gdr_decode_kernel(
         indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
         pool_idx = fx.Int32(indices_tensor[b_i])
 
+        # qkv_strides lets q/k/v be strided views (e.g. column slices of a packed
+        # conv output) instead of contiguous copies.
+        q_stride, k_stride, v_stride = qkv_strides or (None, None, None)
         q_tensor = GTensor(
-            query, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            query,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
+            **({"stride": q_stride} if q_stride else {}),
         )
         k_tensor = GTensor(
-            key, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            key,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
+            **({"stride": k_stride} if k_stride else {}),
         )
         v_tensor = GTensor(
-            value, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+            value,
+            dtype=dtype_,
+            shape=(-1, seq_length, num_v_heads, head_v_dim),
+            **({"stride": v_stride} if v_stride else {}),
         )
         a_tensor = GTensor(
             a,
@@ -179,7 +193,11 @@ def create_vk_gdr_decode_kernel(
         def fast_log1p(x):
             return mlir_math.log1p(x, fastmath=fm_fast)
 
-        cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
+        # Rows whose state index is below min_valid_index are skipped (e.g. 1 when
+        # slot 0 is a reserved padding slot, as in vLLM).
+        cond_valid = arith.cmpi(
+            arith.CmpIPredicate.sge, pool_idx, fx.Int32(min_valid_index)
+        )
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
