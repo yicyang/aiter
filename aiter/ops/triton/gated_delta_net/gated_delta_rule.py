@@ -27,6 +27,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule import (
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     l2norm_fwd,
+    register_host_seq_lens,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -458,6 +459,7 @@ def chunk_gated_delta_rule_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -500,6 +502,10 @@ def chunk_gated_delta_rule_opt_vk(
             calls (no per-forward `.tolist()` D2H).
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
+        seq_lens_cpu: Original sequence lengths on the host, including any
+            leading decode-only sequences. When supplied, chunk metadata is
+            derived from these values without reading ``cu_seqlens`` back from
+            the device (no device->host sync).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -519,6 +525,10 @@ def chunk_gated_delta_rule_opt_vk(
                 f"i.e., {n_prefill} rather than {initial_state.shape[0]}."
             )
 
+    if seq_lens_cpu is not None:
+        if cu_seqlens is None:
+            raise ValueError("`seq_lens_cpu` requires `cu_seqlens`.")
+        register_host_seq_lens(cu_seqlens, seq_lens_cpu)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 

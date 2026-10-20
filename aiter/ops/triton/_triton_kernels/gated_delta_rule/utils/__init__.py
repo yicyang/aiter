@@ -12,6 +12,7 @@ from .index import (
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
+    register_host_seq_lens,
 )
 from .l2norm import l2norm_bwd, l2norm_fwd
 from .solve_tril import solve_tril
@@ -25,6 +26,7 @@ __all__ = [
     "prepare_chunk_offsets",
     "prepare_num_chunks",
     "prepare_rebased_cu_seqlens",
+    "register_host_seq_lens",
     "l2norm_fwd",
     "l2norm_bwd",
     "solve_tril",
