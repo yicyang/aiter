@@ -95,6 +95,38 @@ def _prefill_lens(
     return cu_seqlens[num_decodes + 1 :] - cu_seqlens[num_decodes:-1]
 
 
+_HOST_SEQ_LENS_ATTR = "_aiter_host_seq_lens"
+
+
+def register_host_seq_lens(cu_seqlens: torch.Tensor, seq_lens_cpu) -> None:
+    """Attach host-side per-sequence lengths to a device ``cu_seqlens`` tensor.
+
+    ``prepare_chunk_indices`` / ``prepare_num_chunks`` then derive their
+    results from these host values instead of reading ``cu_seqlens`` back
+    from the device, so the prefill path issues no device->host sync.
+    ``seq_lens_cpu`` must include any leading decode-only sequences, matching
+    ``cu_seqlens`` element for element.
+    """
+    lens = tuple(int(n) for n in seq_lens_cpu)
+    if len(lens) != cu_seqlens.numel() - 1:
+        raise ValueError(
+            f"seq_lens_cpu has {len(lens)} entries but cu_seqlens describes "
+            f"{cu_seqlens.numel() - 1} sequences."
+        )
+    setattr(cu_seqlens, _HOST_SEQ_LENS_ATTR, lens)
+
+
+def _host_prefill_lens(cu_seqlens: torch.Tensor, num_decodes: int):
+    lens = getattr(cu_seqlens, _HOST_SEQ_LENS_ATTR, None)
+    return None if lens is None else lens[num_decodes:]
+
+
+def _to_device_async(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    if like.device.type == "cpu" or t.device.type != "cpu":
+        return t.to(like)
+    return t.pin_memory().to(device=like.device, dtype=like.dtype, non_blocking=True)
+
+
 @tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
@@ -129,15 +161,15 @@ def prepare_chunk_indices(
         Tensor of shape [num_chunks, 2] where each row is [sequence_id, chunk_idx_in_seq]
     """
     _ = num_decode_tokens  # in cache key only
-    indices = torch.cat(
-        [
-            torch.arange(n)
-            for n in triton.cdiv(
-                _prefill_lens(cu_seqlens, num_decodes), chunk_size
-            ).tolist()
-        ]
-    )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    host_lens = _host_prefill_lens(cu_seqlens, num_decodes)
+    if host_lens is not None:
+        counts = [triton.cdiv(n, chunk_size) for n in host_lens]
+    else:
+        counts = triton.cdiv(_prefill_lens(cu_seqlens, num_decodes), chunk_size).tolist()
+    # Explicit CPU: callers may run under torch.set_default_device("cuda").
+    indices = torch.cat([torch.arange(n, device="cpu") for n in counts])
+    out = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    return _to_device_async(out, cu_seqlens)
 
 
 @tensor_cache
@@ -162,9 +194,15 @@ def prepare_chunk_offsets(
         Cumulative chunk offsets [N_prefill+1]
     """
     _ = num_decode_tokens  # in cache key only
+    host_lens = _host_prefill_lens(cu_seqlens, num_decodes)
+    if host_lens is not None:
+        counts = torch.tensor(
+            [0] + [triton.cdiv(n, chunk_size) for n in host_lens], device="cpu"
+        )
+        return _to_device_async(counts.cumsum(-1), cu_seqlens)
     return torch.cat(
         [
-            cu_seqlens.new_tensor([0]),
+            cu_seqlens.new_zeros(1),
             triton.cdiv(_prefill_lens(cu_seqlens, num_decodes), chunk_size),
         ]
     ).cumsum(-1)
@@ -208,6 +246,9 @@ def prepare_num_chunks(
     ``(cu_seqlens identity, chunk_size, num_decodes, num_decode_tokens)``, so
     it runs once per shape rather than once per forward call.
     """
+    host_lens = _host_prefill_lens(cu_seqlens, num_decodes)
+    if host_lens is not None:
+        return sum(triton.cdiv(n, chunk_size) for n in host_lens)
     return int(
         prepare_chunk_offsets(cu_seqlens, chunk_size, num_decodes, num_decode_tokens)[
             -1
