@@ -47,7 +47,15 @@ def create_vk_gdr_decode_kernel(
     WARP_THREADS_K: int = 8,
     qkv_strides: tuple | None = None,
     min_valid_index: int = 0,
+    mtp_chain: bool = False,
+    indices_strides: tuple | None = None,
 ):
+    """mtp_chain=True gives vLLM's MTP-verify contract: ``indices`` is
+    [batch, seq_length]; the initial state is read from
+    ``indices[b, num_accepted[b] - 1]`` (the row is skipped if that slot is below
+    min_valid_index) and the state after token t is written to ``indices[b, t]``
+    (skipped for slots below min_valid_index). Otherwise ``indices`` is [batch]
+    and only the final state is written back, as before."""
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
 
@@ -88,6 +96,8 @@ def create_vk_gdr_decode_kernel(
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
     KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
+    if mtp_chain:
+        KERNEL_NAME += "_mtp"
 
     @flyc.kernel
     def gdr_decode_kernel(
@@ -101,6 +111,7 @@ def create_vk_gdr_decode_kernel(
         indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
+        num_accepted: fx.Tensor,
         batch_size: fx.Int32,
     ):
         scale = arith.constant(SCALE_VALUE, type=T.f32)
@@ -132,8 +143,17 @@ def create_vk_gdr_decode_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
-        indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
-        pool_idx = fx.Int32(indices_tensor[b_i])
+        if const_expr(mtp_chain):
+            indices_tensor = GTensor(
+                indices, dtype=T.i32, shape=(-1, seq_length), stride=indices_strides
+            )
+            nacc_tensor = GTensor(num_accepted, dtype=T.i32, shape=(-1,))
+            pool_idx = fx.Int32(
+                indices_tensor[b_i, fx.Int32(nacc_tensor[b_i]) - fx.Int32(1)]
+            )
+        else:
+            indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
+            pool_idx = fx.Int32(indices_tensor[b_i])
 
         # qkv_strides lets q/k/v be strided views (e.g. column slices of a packed
         # conv output) instead of contiguous copies.
@@ -424,7 +444,40 @@ def create_vk_gdr_decode_kernel(
                         out_tensor[b_i, sq_i, hv_i, global_v_i] = sum_hq
                         scf.YieldOp([])
 
-            for vi in range_constexpr(WARP_TILE_V_ITERS):
+                if const_expr(mtp_chain):
+                    slot = fx.Int32(indices_tensor[b_i, sq_i])
+                    slot_tensor = GTensor(
+                        state,
+                        dtype=state_dtype_,
+                        shape=(num_v_heads, head_v_dim, head_k_dim),
+                        stride=(state_strides[1], state_strides[2], state_strides[3]),
+                        static_bytes_offset_i64=fx.Index(slot)
+                        * fx.Index(state_strides[0])
+                        * get_dtype_bytes(state_dtype),
+                    )
+                    slot_ok = arith.cmpi(
+                        arith.CmpIPredicate.sge, slot, fx.Int32(min_valid_index)
+                    )
+                    slot_ok_if = scf.IfOp(slot_ok, results_=[], has_else=False)
+                    with ir.InsertionPoint(slot_ok_if.then_block):
+                        for vi in range_constexpr(WARP_TILE_V_ITERS):
+                            global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
+                            for ki in range_constexpr(WARP_TILE_K_ITERS):
+                                warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                                if const_expr("f32" in state_dtype):
+                                    out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                                else:
+                                    out_vec = state_vecs[
+                                        vi * WARP_TILE_K_ITERS + ki
+                                    ].truncf(vec_t)
+                                slot_tensor.vec_store(
+                                    (hv_i, global_v_i, warp_k_vec_i),
+                                    out_vec,
+                                    VALUES_PER_THREAD_K,
+                                )
+                        scf.YieldOp([])
+
+            for vi in range_constexpr(0 if mtp_chain else WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
@@ -450,6 +503,7 @@ def create_vk_gdr_decode_kernel(
         indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
+        num_accepted: fx.Tensor,
         batch_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -466,6 +520,7 @@ def create_vk_gdr_decode_kernel(
             indices,
             state,
             out,
+            num_accepted,
             batch_size,
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
