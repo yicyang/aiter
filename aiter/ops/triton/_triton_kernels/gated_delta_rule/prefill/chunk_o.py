@@ -24,6 +24,7 @@ from ..utils import (
     prepare_rebased_cu_seqlens,
 )
 from ..utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
@@ -837,7 +838,17 @@ def chunk_fwd_o_opt(
             for BV in BKV_LIST
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
+        default_config=get_tuned_kernel_config(
+            "attention",
+            "GATED_DELTA_RULE",
+            "chunk_fwd_kernel_o_opt_vk",
+            fallback=triton.Config(
+                {"BK": BKV_LIST[0], "BV": BKV_LIST[0]},
+                num_warps=NUM_WARPS[0],
+                num_stages=2,
+            ),
+        ),
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
