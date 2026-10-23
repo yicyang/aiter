@@ -319,6 +319,8 @@ def expand_groups(groups):
 K5_MODELS = {
     "35b": {"label": "Qwen3.5-35B", "Hv": 32},
     "397b": {"label": "Qwen3.5-397B", "Hv": 64},
+    # Qwen3.8-Flash-Next: Hk=16, Hv=48 (tuned at TP2 only).
+    "qwen38_flash": {"label": "Qwen3.8-Flash-Next", "Hv": 48, "tps": [2]},
 }
 _DENSE_PROMPT_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
 _VARLEN_SEQLENS = [1024, 2048, 4096, 8192]
@@ -328,10 +330,10 @@ _SNAPSHOT_DTYPES = {"bf16": None, "fp32": torch.float32}  # None -> k.dtype (bf1
 _STATE_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 
-def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+def _k5_dense_groups(model_name: str, hv: int, tps=None) -> list[PrefillGroup]:
     """Dense prefill: TP x T sweep x bf16/fp32 per-chunk snapshot."""
     groups: list[PrefillGroup] = []
-    for tp in _K5_TPS:
+    for tp in tps or _K5_TPS:
         groups.append(
             PrefillGroup(
                 model_name=f"{model_name}-dense-tp{tp}-bf16snap",
@@ -358,10 +360,10 @@ def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
     return groups
 
 
-def _k5_varlen_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+def _k5_varlen_groups(model_name: str, hv: int, tps=None) -> list[PrefillGroup]:
     """Varlen prefill: TP x seqlen x total T x bf16/fp32 snapshot."""
     groups: list[PrefillGroup] = []
-    for tp in _K5_TPS:
+    for tp in tps or _K5_TPS:
         groups.append(
             PrefillGroup(
                 model_name=f"{model_name}-varlen-tp{tp}-bf16snap",
@@ -389,6 +391,16 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
+    *_k5_dense_groups(
+        K5_MODELS["qwen38_flash"]["label"],
+        K5_MODELS["qwen38_flash"]["Hv"],
+        K5_MODELS["qwen38_flash"]["tps"],
+    ),
+    *_k5_varlen_groups(
+        K5_MODELS["qwen38_flash"]["label"],
+        K5_MODELS["qwen38_flash"]["Hv"],
+        K5_MODELS["qwen38_flash"]["tps"],
+    ),
 ]
 
 # Full tuner catalog. ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py`` loads this module

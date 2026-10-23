@@ -780,12 +780,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     if BV is None:
         BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
 
-    if _OPT_BV_ENV:
+    # Read at call time: the BV tuner sets this env per candidate after import.
+    bv_env = os.environ.get("FLYDSL_K5_OPT_BV", _OPT_BV_ENV)
+    if bv_env:
         try:
-            BV = int(_OPT_BV_ENV)
+            BV = int(bv_env)
         except ValueError as exc:
             raise ValueError(
-                f"FLYDSL_K5_OPT_BV must be one of 16, 32, or 64, got {_OPT_BV_ENV!r}."
+                f"FLYDSL_K5_OPT_BV must be one of 16, 32, or 64, got {bv_env!r}."
             ) from exc
     if BV not in (16, 32, 64):
         raise ValueError(f"opt BV must be in {{16,32,64}}, got {BV}.")
