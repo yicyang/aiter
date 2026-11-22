@@ -270,6 +270,9 @@ def _build_moe_gemm2_1x4(
     ):
         """One M64 down task (all N tiles); plain helper shared by the per-task kernel and
         the persistent mega kernel. lds_alloc(dtype, count, align) -> storage with .peek()."""
+        # The memoized copy atoms / tiled copies are MLIR values: a second call site (another
+        # region of a persistent kernel) must not reuse the first one's.
+        down_ops.clear_all()
         e_offset = fx.Int64(e_idx)
         if const_expr(_task_table):
             row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
