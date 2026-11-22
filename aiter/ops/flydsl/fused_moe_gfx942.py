@@ -1,3 +1,4 @@
+import dataclasses
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
@@ -849,7 +850,7 @@ def _use_fused_gateup_quant(
     )
 
 
-def _fused_gateup_quant_kernel(*, gateup_dim, model_dim, topk, experts):
+def _fused_gateup_quant_kernel(*, gateup_dim, model_dim, topk, experts, xcd_group=None):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_moe_gemm1
 
     return compile_moe_gemm1(
@@ -869,7 +870,13 @@ def _fused_gateup_quant_kernel(*, gateup_dim, model_dim, topk, experts):
         FUSE_QUANT=True,
         # N = 384 needs 260 VGPRs uncapped; capped it fits 256 with no spills (2 waves/SIMD).
         WAVES_PER_EU=2 if gateup_dim <= 384 else 0,
+        XCD_GROUP=xcd_group,
     )
+
+
+_SPLIT_DOWN = None
+_SPLIT_STATE = {}
+_SPLIT_SIDE = {}
 
 
 def _run_prefill(
@@ -910,6 +917,30 @@ def _run_prefill(
         0,
         output_aux=AUX_SORT_OPUS,
     )
+    seg_sorts, seg_ready = None, None
+    weight_dtype_str_pre = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
+    _full = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out, None, loc_ids)
+    if _SPLIT_DOWN is not None and weight_dtype_str_pre == "fp8":
+
+        def _sortf(ids, w):
+            return moe_sorting(
+                ids, w, problem.experts, problem.model_dim, hidden_states.dtype,
+                config.BLOCK_M, None, None, 0, output_aux=AUX_SORT_OPUS,
+            )
+
+        if _SPLIT_SIDE.get("stream") is not None:
+            side, main = _SPLIT_SIDE["stream"], torch.cuda.current_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                seg_sorts = _SPLIT_DOWN(topk_ids, topk_weight, _sortf, _full)
+                seg_ready = torch.cuda.Event()
+                seg_ready.record(side)
+            for v in seg_sorts.values():
+                for t in v:
+                    if isinstance(t, torch.Tensor):
+                        t.record_stream(main)
+        else:
+            seg_sorts = _SPLIT_DOWN(topk_ids, topk_weight, _sortf, _full)
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
     quant_func = (
@@ -958,6 +989,10 @@ def _run_prefill(
             model_dim=problem.model_dim,
             topk=problem.topk,
             experts=problem.experts,
+            # Same-expert blocks share weights in one XCD's L2: -2% at 16k rows, +4% at 2k.
+            xcd_group=(8 if problem.batch >= 8192 else 0)
+            if os.environ.get("MOE_XCD_AUTO", "0") == "1"
+            else None,
         )
     else:
         gemm1_out = _gateup_output(hidden_states, problem)
@@ -985,22 +1020,39 @@ def _run_prefill(
     activation_scalars = _activation_scalars(
         activation_str, situ_beta, situ_linear_beta, swiglu_limit
     )
-    _launch(
-        gateup_kernel,
-        gateup_in,
-        w1,
-        gemm1_out,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
-        a_scale,
-        problem.batch,
-        task_num,
-        *activation_scalars,
-        *quant_out,
-    )
+
+    def _gateup_launch(seg=None, r0=0, r1=None):
+        if seg is None:
+            g_args = (gateup_in, sorted_ids, sorted_weights, sorted_expert_ids,
+                      num_valid_ids, a_scale, problem.batch, task_num, quant_out)
+        else:
+            assert fuse_quant
+            row = problem.topk * problem.inter_dim * down_in.element_size()
+            g_args = (gateup_in[r0:r1], seg[0], seg[1], seg[2], seg[3], a_scale[r0:r1],
+                      r1 - r0, int(seg[2].shape[0]),
+                      (down_in.data_ptr() + r0 * row,
+                       down_in_scale.data_ptr() + r0 * problem.topk * 4))
+        g_in, g_sid, g_sw, g_seid, g_nv, g_asc, g_m, g_tasks, g_q = g_args
+        _launch(
+            gateup_kernel,
+            g_in,
+            w1,
+            gemm1_out,
+            g_sid,
+            g_sw,
+            g_seid,
+            g_nv,
+            w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
+            g_asc,
+            g_m,
+            g_tasks,
+            *activation_scalars,
+            *g_q,
+        )
+
+    gateup_split = seg_sorts is not None and fuse_quant and _SPLIT_STATE.get("gateup_split")
+    if not gateup_split:
+        _gateup_launch()
 
     if fuse_quant:
         pass
@@ -1015,80 +1067,125 @@ def _run_prefill(
         down_in = gemm1_out
         down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
-    output_padding_bytes = config.down_output_padding_bytes
-    output_row_size = problem.model_dim + (
-        output_padding_bytes // hidden_states.element_size()
-        if output_padding_bytes is not None
-        else 0
-    )
-    gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    down_tile_n = {
-        "default": 128,
-        "1x4_64x256": 256,
-        "8x1": 128,
-        "8x1_compact": 128,
-    }[config.down_path]
-    down_kernel = _get_compiled_kernel(
-        N=problem.model_dim,
-        K=problem.inter_dim,
-        weight_dtype_str=weight_dtype_str,
-        quant_type_str=problem.quant_type,
-        TOPK=problem.topk,
-        BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=down_tile_n,
-        stage="down",
-        alg="prefill_1x4",
-        E=problem.experts,
-        USE_ATOMIC_WRITE=False,
-        act_quant_type_str=problem.quant_type,
-        down_path=config.down_path,
-        down_output_padding_bytes=output_padding_bytes,
-        METADATA_TILE_SIZE_M=config.BLOCK_M,
-    )
-    down_args = (
-        down_in,
-        w2,
-        gemm2_out,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
-        down_in_scale,
-        problem.batch,
-        task_num,
-    )
-    if config.down_path == "default":
-        _launch(down_kernel, *down_args, *activation_scalars)
-    elif config.down_path == "8x1_compact":
-        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
-            allocate_task_buffers,
-        )
+    def _down_sum(r0, r1, seg=None, lazy_sum=False):
+        """Down + top-k sum for tokens [r0, r1); seg = that subset's sort (None = whole)."""
+        nonlocal sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out, loc_ids
+        nonlocal down_in, down_in_scale, task_num
+        problem_full = problem
+        if seg is not None:
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out, _, loc_ids = seg
+            task_num = int(sorted_expert_ids.shape[0])
+        d_in = down_in[r0 * problem.topk:r1 * problem.topk] if seg is not None else down_in
+        d_scale = down_in_scale[r0 * problem.topk:r1 * problem.topk] if seg is not None else down_in_scale
+        problem_seg = dataclasses.replace(problem, batch=r1 - r0) if seg is not None else problem
+        return _down_sum_impl(problem_seg, d_in, d_scale, lazy_sum)
 
-        full_tasks, tail_tasks, task_counts = allocate_task_buffers(
+    def _down_sum_impl(problem, down_in, down_in_scale, lazy_sum=False):
+        output_padding_bytes = config.down_output_padding_bytes
+        output_row_size = problem.model_dim + (
+            output_padding_bytes // hidden_states.element_size()
+            if output_padding_bytes is not None
+            else 0
+        )
+        gemm2_out = torch.empty(
+            [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        down_tile_n = {
+            "default": 128,
+            "1x4_64x256": 256,
+            "8x1": 128,
+            "8x1_compact": 128,
+        }[config.down_path]
+        down_kernel = _get_compiled_kernel(
+            N=problem.model_dim,
+            K=problem.inter_dim,
+            weight_dtype_str=weight_dtype_str,
+            quant_type_str=problem.quant_type,
+            TOPK=problem.topk,
+            BLOCK_TILE_SIZE_M=config.BLOCK_M,
+            BLOCK_TILE_SIZE_N=down_tile_n,
+            stage="down",
+            alg="prefill_1x4",
+            E=problem.experts,
+            USE_ATOMIC_WRITE=False,
+            act_quant_type_str=problem.quant_type,
+            down_path=config.down_path,
+            down_output_padding_bytes=output_padding_bytes,
+            METADATA_TILE_SIZE_M=config.BLOCK_M,
+        )
+        down_args = (
+            down_in,
+            w2,
+            gemm2_out,
+            sorted_ids,
+            sorted_weights,
             sorted_expert_ids,
-            problem.experts,
+            num_valid_ids,
+            w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
+            down_in_scale,
+            problem.batch,
+            task_num,
         )
-        _launch(
-            down_kernel,
-            *down_args,
-            full_tasks,
-            tail_tasks,
-            task_counts,
-            full_tasks.shape[0],
-            tail_tasks.shape[0],
-        )
-    else:
-        _launch(down_kernel, *down_args)
+        if config.down_path == "default":
+            _launch(down_kernel, *down_args, *activation_scalars)
+        elif config.down_path == "8x1_compact":
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
+                allocate_task_buffers,
+            )
 
-    sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)(
-        loc_ids, gemm2_out, cur_out, problem.batch
-    )
-    return cur_out
+            full_tasks, tail_tasks, task_counts = allocate_task_buffers(
+                sorted_expert_ids,
+                problem.experts,
+            )
+            _launch(
+                down_kernel,
+                *down_args,
+                full_tasks,
+                tail_tasks,
+                task_counts,
+                full_tasks.shape[0],
+                tail_tasks.shape[0],
+            )
+        else:
+            _launch(down_kernel, *down_args)
+
+        summer = sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)
+        if lazy_sum:
+            loc, out = loc_ids.view(-1), cur_out
+
+            def _sum_rows(a, b):
+                summer(loc[a * problem.topk:b * problem.topk], gemm2_out, out[a:b], b - a)
+                return out[a:b]
+
+            return _sum_rows
+        summer(loc_ids, gemm2_out, cur_out, problem.batch)
+        return cur_out
+
+    if seg_sorts is not None and fuse_quant:
+        segs = seg_sorts  # {(r0, r1): sort of that subset}
+        if seg_ready is not None:
+            torch.cuda.current_stream().wait_event(seg_ready)
+        if gateup_split:
+
+            def _rows(r0, r1):
+                _gateup_launch(segs[(r0, r1)], r0, r1)
+                return _down_sum(r0, r1, segs[(r0, r1)])
+
+            _SPLIT_STATE["rows"] = _rows
+        else:
+            done = {}
+
+            def _rows_chunked(r0, r1):
+                key = next(k for k in segs if k[0] <= r0 and r1 <= k[1])
+                if key not in done:
+                    done[key] = _down_sum(key[0], key[1], segs[key], lazy_sum=True)
+                return done[key](r0 - key[0], r1 - key[0])
+
+            _SPLIT_STATE["rows"] = _rows_chunked
+        return cur_out
+    return _down_sum(0, problem.batch)
 
 
 def _run_batch1(

@@ -65,6 +65,8 @@ def _build_moe_gemm2_8x1_compact(
         tail = _build_moe_gemm2_default(
             **tail_common, BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, down_path="default",
         )
+    if os.environ.get("MOE_DOWN_MIN_TAIL_UTIL"):
+        _min_tail_utilization = float(os.environ["MOE_DOWN_MIN_TAIL_UTIL"])
     build = build_task_table(E, min_tail_utilization=_min_tail_utilization)
 
     @flyc.jit

@@ -45,8 +45,16 @@ def _build_moe_gemm1(
     fused_down_clear=False,
     FUSE_QUANT=False,
     WAVES_PER_EU=0,
+    XCD_GROUP=None,
 ):
     assert stage == "gateup"
+    if XCD_GROUP is None:
+        XCD_REMAP = alg == "prefill_1x4" and os.environ.get("MOE_XCD_REMAP", "0") == "1"
+        XCD_GROUP = int(os.environ.get("MOE_XCD_GROUP", "0"))
+    else:
+        XCD_REMAP = alg == "prefill_1x4" and XCD_GROUP > 0
+    SKIP_PAD = alg == "prefill_1x4" and os.environ.get("MOE_GATEUP_SKIP_PAD", "0") == "1"
+    SKIP_PAD_ONE = os.environ.get("MOE_GATEUP_SKIP_PAD_ONE", "0") == "1"
     if FUSE_QUANT:
         assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
         assert BLOCK_TILE_SIZE_M % 64 == 0 and (N // 2) % 32 == 0
@@ -1533,6 +1541,7 @@ def _build_moe_gemm1(
         arg_p_input: fx.Tensor,  # [M, K]; A rows are gathered via lds.sorted_lds
         arg_p_weight: fx.Tensor,  # preshuffle layout with gate/up grouping composed
         lds,  # SharedStorage with sorted_lds, a_ping, a_pong
+        n_active=None,  # token sub-tiles (16 rows) to compute; the rest stay 0
     ):
         """1x4 tiled GEMM: the 4 waves tile N(channel); the full TILE_M is shared across
         all waves (no M-split). Each wave owns contiguous_n//4 output channels of BOTH the
@@ -1687,7 +1696,8 @@ def _build_moe_gemm1(
         k_per_mma = 16 if const_expr(weight_dtype == fx.BFloat16) else 32
         _m_reps = fx.size(fx.get_shape(c_gate)[1]).to_py_value()
         _n_reps = fx.size(fx.get_shape(c_gate)[2]).to_py_value()
-        mfma_per_gemm = _m_reps * _n_reps * (TILE_K // k_per_mma)
+        _n_act = _n_reps if n_active is None else n_active
+        mfma_per_gemm = _m_reps * _n_act * (TILE_K // k_per_mma)
         mem_a_cnt = a_cp_frag.load().numel * weight_dtype.width // 8 // 16
         mem_b_cnt = bl_frag_st[0].load().numel * weight_dtype.width // 8 // 16
         # per-ki interleave: k_perm groups 2 MFMA-K atoms, so k_iters = TILE_K / (2*k_per_mma).
@@ -1744,7 +1754,7 @@ def _build_moe_gemm1(
                     a_lds_r[read_i][None, None, ki],
                     a_frag_retile[None, None, ki],
                 )
-                for n in range_constexpr(_n_reps):
+                for n in range_constexpr(_n_act):
                     for m in range_constexpr(_m_reps):
                         for k in range_constexpr(2):
                             fx.mma_atom_call(
@@ -2268,7 +2278,6 @@ def _build_moe_gemm1(
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
-        e_idx = gpu.block_idx.y
 
         if const_expr(weight_dtype != fx.BFloat16):
             in_ptr = fx.recast_iter(weight_dtype, fxh._as_ptr(p_input))
@@ -2279,6 +2288,20 @@ def _build_moe_gemm1(
             fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid_ids)), fx.make_layout(1, 1)
         )
         max_valid_id = num_valid_buf[0]
+        if const_expr(XCD_REMAP):
+            # Workgroups go round-robin over the 8 XCDs; give each XCD a contiguous run of
+            # tasks so the blocks of one expert share its weights in that XCD's L2.
+            # The launch rounds the grid up to a multiple of 8.
+            p_lin = gpu.block_idx.y
+            if const_expr(XCD_GROUP == 0):
+                n_task = (max_valid_id + (BLOCK_TILE_SIZE_M - 1)) // BLOCK_TILE_SIZE_M
+                per_xcd = (n_task + 7) // 8
+                e_idx = (p_lin % 8) * per_xcd + p_lin // 8
+            else:
+                k_xcd = p_lin // 8
+                e_idx = (k_xcd // XCD_GROUP) * (8 * XCD_GROUP) + (p_lin % 8) * XCD_GROUP + k_xcd % XCD_GROUP
+        else:
+            e_idx = gpu.block_idx.y
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(weight_dtype, fxh._as_ptr(p_weight))
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
@@ -2368,94 +2391,114 @@ def _build_moe_gemm1(
                 asc_idx = fx.make_fragment_like(asc_thr)
                 fx.copy(cp_atom_idx, asc_thr, asc_idx)
 
-            c_gate_frag, c_up_frag = gemm_1x4(
-                BLOCK_TILE_SIZE_M,
-                BLOCK_TILE_SIZE_N,
-                TILE_K,
-                blk_n,
-                arg_p_input,
-                arg_p_weight,
-                lds,
-            )
+            def gemm_and_epilogue(n_active):
+                c_gate_frag, c_up_frag = gemm_1x4(
+                    BLOCK_TILE_SIZE_M,
+                    BLOCK_TILE_SIZE_N,
+                    TILE_K,
+                    blk_n,
+                    arg_p_input,
+                    arg_p_weight,
+                    lds,
+                    n_active=n_active,
+                )
 
-            if const_expr(weight_dtype != fx.BFloat16):
-                _apply_1x4_fp8_dequant(
+                if const_expr(weight_dtype != fx.BFloat16):
+                    _apply_1x4_fp8_dequant(
+                        c_gate_frag,
+                        c_up_frag,
+                        tid,
+                        expert_id,
+                        blk_n,
+                        contiguous_n,
+                        asc_idx,
+                        M,
+                        p_w_scale,
+                        p_a_scale,
+                    )
+
+                c_out_bf16 = _gateup_pair_bf16(
                     c_gate_frag,
                     c_up_frag,
-                    tid,
-                    expert_id,
-                    blk_n,
-                    contiguous_n,
-                    asc_idx,
-                    M,
-                    p_w_scale,
-                    p_a_scale,
+                    situ_beta_f,
+                    situ_beta_rcp_f,
+                    situ_linear_beta_f,
+                    situ_linear_beta_rcp_f,
+                    activation_limit_f,
                 )
 
-            c_out_bf16 = _gateup_pair_bf16(
-                c_gate_frag,
-                c_up_frag,
-                situ_beta_f,
-                situ_beta_rcp_f,
-                situ_linear_beta_f,
-                situ_linear_beta_rcp_f,
-                activation_limit_f,
-            )
-
-            # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
-            # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
-            # the same 1x4 tiled_mma as _gemm_1x4. B-first makes the value dim 4 contiguous
-            # channels, so the store is 64-bit; read it back channel-contiguous (8 bf16/lane)
-            # so the scatter issues 128-bit writes.
-            _, _tiled_mma = _make_1x4_tiled_mma()
-            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-            cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
-            # B-first: store through the (channel=M, token=N) transpose view so the value dim
-            # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
-            # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
-            # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
-            # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
-            # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
-            # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
-            # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
-            # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
-            swz_c = fx.SwizzleType.get(3, 3, 3)
-            lds_c_store = fx.make_view(
-                cshuf_ptr,
-                fx.make_composed_layout(
-                    fx.static(swz_c),
-                    fx.make_ordered_layout(
-                        (contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)
+                # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
+                # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
+                # the same 1x4 tiled_mma as _gemm_1x4. B-first makes the value dim 4 contiguous
+                # channels, so the store is 64-bit; read it back channel-contiguous (8 bf16/lane)
+                # so the scatter issues 128-bit writes.
+                _, _tiled_mma = _make_1x4_tiled_mma()
+                cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+                cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+                cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+                # B-first: store through the (channel=M, token=N) transpose view so the value dim
+                # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
+                # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
+                # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
+                # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
+                # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
+                # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
+                # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
+                # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
+                swz_c = fx.SwizzleType.get(3, 3, 3)
+                lds_c_store = fx.make_view(
+                    cshuf_ptr,
+                    fx.make_composed_layout(
+                        fx.static(swz_c),
+                        fx.make_ordered_layout(
+                            (contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)
+                        ),
                     ),
-                ),
-            )
-            lds_c = fx.make_view(
-                cshuf_ptr,
-                fx.make_composed_layout(
-                    fx.static(swz_c),
-                    fx.make_ordered_layout(
-                        (BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)
-                    ),
-                ),
-            )
-
-            gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
-            store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
-            fx.copy(
-                cshuf_atom_w,
-                store_c.retile(c_out_bf16),
-                store_c.partition_D(lds_c_store),
-            )
-            gpu.barrier()
-            if const_expr(FUSE_QUANT):
-                _quant_rows_epilogue(
-                    lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale
                 )
+                lds_c = fx.make_view(
+                    cshuf_ptr,
+                    fx.make_composed_layout(
+                        fx.static(swz_c),
+                        fx.make_ordered_layout(
+                            (BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)
+                        ),
+                    ),
+                )
+
+                gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
+                store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
+                fx.copy(
+                    cshuf_atom_w,
+                    store_c.retile(c_out_bf16),
+                    store_c.partition_D(lds_c_store),
+                )
+                gpu.barrier()
+                if const_expr(FUSE_QUANT):
+                    _quant_rows_epilogue(
+                        lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale
+                    )
+                else:
+                    rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
+                    fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
+                    c_out.copy(buf_atom_w128, blk_n, rd)
+
+            if const_expr(SKIP_PAD and BLOCK_TILE_SIZE_M == 64):
+                # Rows of a block are its expert's routes, padding last; skip the 16-row
+                # token sub-tiles 2-3 when row 32 is already padding.
+                row32 = sorted_ids_buf[32]
+                if (row32 & 0xFFFFFF) < M:
+                    gemm_and_epilogue(None)
+                else:
+                    if const_expr(SKIP_PAD_ONE):
+                        row16 = sorted_ids_buf[16]
+                        if (row16 & 0xFFFFFF) < M:
+                            gemm_and_epilogue(2)
+                        else:
+                            gemm_and_epilogue(1)
+                    else:
+                        gemm_and_epilogue(2)
             else:
-                rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
-                fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-                c_out.copy(buf_atom_w128, blk_n, rd)
+                gemm_and_epilogue(None)
 
     @flyc.jit
     def launch_splitk(
@@ -2556,6 +2599,8 @@ def _build_moe_gemm1(
         task_num *= gateup_tasks_per_metadata
         if const_expr(E is not None) and M * TOPK <= E:
             task_num = M * TOPK * gateup_tasks_per_metadata
+        if const_expr(XCD_REMAP):
+            task_num = (task_num + (8 * max(XCD_GROUP, 1) - 1)) // (8 * max(XCD_GROUP, 1)) * (8 * max(XCD_GROUP, 1))
         moe_2stage_gateup_prefill_1x4(
             p_input,
             p_weight,
@@ -2608,6 +2653,7 @@ def _compile_moe_gemm1_cached(
     METADATA_TILE_SIZE_M=None,
     FUSE_QUANT=False,
     WAVES_PER_EU=0,
+    XCD_GROUP=None,
 ):
     del device_cache_key
     return _build_moe_gemm1(
@@ -2634,6 +2680,7 @@ def _compile_moe_gemm1_cached(
         fused_down_clear=fused_down_clear,
         FUSE_QUANT=FUSE_QUANT,
         WAVES_PER_EU=WAVES_PER_EU,
+        XCD_GROUP=XCD_GROUP,
     )
 
 
@@ -2659,6 +2706,7 @@ def compile_moe_gemm1(
     METADATA_TILE_SIZE_M=None,
     FUSE_QUANT=False,
     WAVES_PER_EU=0,
+    XCD_GROUP=None,
 ):
     """Build and cache a stage1 gate-up launcher for one static configuration.
 
@@ -2687,6 +2735,7 @@ def compile_moe_gemm1(
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
         FUSE_QUANT=FUSE_QUANT,
         WAVES_PER_EU=WAVES_PER_EU,
+        XCD_GROUP=XCD_GROUP,
     )
 
 

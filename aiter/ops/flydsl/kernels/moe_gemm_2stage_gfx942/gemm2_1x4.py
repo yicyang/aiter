@@ -44,6 +44,7 @@ def _build_moe_gemm2_1x4(
     _task_table=False,
     _store_cache=_DOWN_STORE_CACHE_MODIFIER,
 ):
+    PREFETCH_TILE = os.environ.get("MOE_DOWN_PREFETCH_TILE", "0") == "1"
     assert stage == "down"
     assert down_path == "1x4_64x256"
     # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
@@ -841,68 +842,131 @@ def _build_moe_gemm2_1x4(
                 if const_expr(k_core + 1 == nBK and weight_quant_type == "ptpc"):
                     commit_scale_block_lds(next_scale_vec, next_frag_pc_scale)
 
-            previous_fragC = None
-            if const_expr(use_delayed_4wave_store):
-                previous_fragC = fx.make_fragment_like(fragC)
-                previous_fragC.fill(0)
+            prefetch_tile = PREFETCH_TILE and not use_delayed_4wave_store
 
-            delayed_output_state_index = 2 if weight_quant_type == "ptpc" else 1
-            if const_expr(weight_quant_type == "ptpc"):
-                loop_state = [frag_weight.load(), frag_pc_scale.load()]
-            else:
-                loop_state = [frag_weight.load()]
-            if const_expr(use_delayed_4wave_store):
-                loop_state.append(previous_fragC.load())
-            for block_n, state in range(
-                fx.Int64(0),
-                fx.Int64(nBN),
-                fx.Int64(1),
-                init=loop_state,
-            ):
-                # Restore the next weight/scale and any delayed output tile.
-                frag_weight_slots[0].store(state[0])
+            def run_tile_prefetch_k_core(block_n, k_core, tile_slots, next_frag_pc_scale):
+                # Every chunk of this tile is already in registers; after its MFMAs, refill
+                # the same slot with that chunk of the next N tile (prefetch distance = 1 tile).
+                next_scale_vec = None
+                down_ops.load_tiled_mma_fragB(
+                    mm, ldsA, [None, None, 0, k_core], frag_act
+                )
+                enter_compute_stage()
+                fx.gemm(mm, fragC, tile_slots[k_core], frag_act, fragC)
+                enter_read_write_stage()
+                if const_expr(k_core == 0 and weight_quant_type == "ptpc"):
+                    next_scale_vec = issue_scale_block_global(block_n + 1)
+                    fx.rocdl.sched_barrier(0)
+                down_ops.load_tiled_mma_fragA(
+                    mm, weight, [None, None, block_n + 1, k_core], tile_slots[k_core]
+                )
+                return next_scale_vec
+
+            if const_expr(prefetch_tile):
+                tile_slots = [
+                    fx.make_fragment_like(frag_weight) for _ in range_constexpr(nBK)
+                ]
+                tile_slots[0].store(frag_weight.load())
+                pt_pc_scale = None
                 if const_expr(weight_quant_type == "ptpc"):
-                    frag_pc_scale.store(state[1])
-                if const_expr(use_delayed_4wave_store):
-                    previous_fragC.store(state[delayed_output_state_index])
-
-                # Compute this N tile while retiring the previous tile's stores.
-                fragC.fill(0)
-                for k_core in range_constexpr(nBK):
-                    run_k_core_pipeline(
-                        block_n,
-                        k_core,
-                        previous_fragC,
-                        next_frag_pc_scale,
+                    pt_pc_scale = fx.make_fragment_like(frag_pc_scale)
+                    pt_pc_scale.store(frag_pc_scale.load())
+                for k_pre in range_constexpr(1, nBK):
+                    down_ops.load_tiled_mma_fragA(
+                        mm, weight, [None, None, fx.Int32(0), k_pre], tile_slots[k_pre]
                     )
-
-                # Apply channel scale, routing weight and BF16 conversion.
+                pt_state = [t.load() for t in tile_slots]
                 if const_expr(weight_quant_type == "ptpc"):
-                    for fc, fpc in fxh.all_elements(fragC, frag_pc_scale):
-                        fc.store(fc.load() * fpc.load())
-                if not const_expr(use_delayed_4wave_store):
+                    pt_state.append(pt_pc_scale.load())
+                for block_n, state in range(
+                    fx.Int64(0), fx.Int64(nBN), fx.Int64(1), init=pt_state
+                ):
+                    for k_pre in range_constexpr(nBK):
+                        tile_slots[k_pre].store(state[k_pre])
+                    if const_expr(weight_quant_type == "ptpc"):
+                        pt_pc_scale.store(state[nBK])
+                    fragC.fill(0)
+                    scale_vec = None
+                    for k_core in range_constexpr(nBK):
+                        v = run_tile_prefetch_k_core(
+                            block_n, k_core, tile_slots, next_frag_pc_scale
+                        )
+                        if const_expr(k_core == 0):
+                            scale_vec = v
+                    if const_expr(weight_quant_type == "ptpc"):
+                        commit_scale_block_lds(scale_vec, next_frag_pc_scale)
+                        for fc, fpc in fxh.all_elements(fragC, pt_pc_scale):
+                            fc.store(fc.load() * fpc.load())
                     _store_scaled_bf16(fragC, frag_sorted_weight, fragC_bf16)
                     store_cshuffle_n256(fragC_bf16, block_n, cshuffle_lds)
+                    nxt = [t.load() for t in tile_slots]
+                    if const_expr(weight_quant_type == "ptpc"):
+                        nxt.append(next_frag_pc_scale.load())
+                    results = yield nxt
 
-                if const_expr(weight_quant_type == "ptpc"):
-                    next_state = [
-                        frag_weight_slots[nBK % 2].load(),
-                        next_frag_pc_scale.load(),
-                    ]
-                else:
-                    next_state = [frag_weight_slots[nBK % 2].load()]
+            if const_expr(not prefetch_tile):
+                previous_fragC = None
                 if const_expr(use_delayed_4wave_store):
-                    next_state.append(fragC.load())
-                results = yield next_state
+                    previous_fragC = fx.make_fragment_like(fragC)
+                    previous_fragC.fill(0)
 
-            # Drain the final delayed tile after the N loop.
-            if const_expr(use_delayed_4wave_store):
-                previous_fragC.store(results[delayed_output_state_index])
-                postprocess_store_vector_4wave(
-                    previous_fragC,
-                    frag_sorted_weight,
-                    fx.Int64(nBN - 1),
-                )
+                delayed_output_state_index = 2 if weight_quant_type == "ptpc" else 1
+                if const_expr(weight_quant_type == "ptpc"):
+                    loop_state = [frag_weight.load(), frag_pc_scale.load()]
+                else:
+                    loop_state = [frag_weight.load()]
+                if const_expr(use_delayed_4wave_store):
+                    loop_state.append(previous_fragC.load())
+                for block_n, state in range(
+                    fx.Int64(0),
+                    fx.Int64(nBN),
+                    fx.Int64(1),
+                    init=loop_state,
+                ):
+                    # Restore the next weight/scale and any delayed output tile.
+                    frag_weight_slots[0].store(state[0])
+                    if const_expr(weight_quant_type == "ptpc"):
+                        frag_pc_scale.store(state[1])
+                    if const_expr(use_delayed_4wave_store):
+                        previous_fragC.store(state[delayed_output_state_index])
+
+                    # Compute this N tile while retiring the previous tile's stores.
+                    fragC.fill(0)
+                    for k_core in range_constexpr(nBK):
+                        run_k_core_pipeline(
+                            block_n,
+                            k_core,
+                            previous_fragC,
+                            next_frag_pc_scale,
+                        )
+
+                    # Apply channel scale, routing weight and BF16 conversion.
+                    if const_expr(weight_quant_type == "ptpc"):
+                        for fc, fpc in fxh.all_elements(fragC, frag_pc_scale):
+                            fc.store(fc.load() * fpc.load())
+                    if not const_expr(use_delayed_4wave_store):
+                        _store_scaled_bf16(fragC, frag_sorted_weight, fragC_bf16)
+                        store_cshuffle_n256(fragC_bf16, block_n, cshuffle_lds)
+
+                    if const_expr(weight_quant_type == "ptpc"):
+                        next_state = [
+                            frag_weight_slots[nBK % 2].load(),
+                            next_frag_pc_scale.load(),
+                        ]
+                    else:
+                        next_state = [frag_weight_slots[nBK % 2].load()]
+                    if const_expr(use_delayed_4wave_store):
+                        next_state.append(fragC.load())
+                    results = yield next_state
+
+                # Drain the final delayed tile after the N loop.
+                if const_expr(use_delayed_4wave_store):
+                    previous_fragC.store(results[delayed_output_state_index])
+                    postprocess_store_vector_4wave(
+                        previous_fragC,
+                        frag_sorted_weight,
+                        fx.Int64(nBN - 1),
+                    )
             fx.rocdl.sched_barrier(0)
             fx.rocdl.s_setprio(0)
             fx.rocdl.sched_barrier(0)
