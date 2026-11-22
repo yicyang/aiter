@@ -94,6 +94,20 @@ def _hw_id():
     return fx.Int32(v)
 
 
+def _acq(dbg):
+    if (dbg & 128) == 0:
+        _fence(llvm.AtomicOrdering.acquire)
+
+
+def _inv(dbg):
+    if (dbg & 128) == 0:
+        _inv_l1()
+
+
+def _inv_l1_l2():
+    llvm.InlineAsmOp(None, [], "buffer_inv sc0 sc1\ns_waitcnt vmcnt(0)", "~{memory}", has_side_effects=True)
+
+
 class _Carved:
     """Stands in for a SharedAllocator storage: .peek().view(layout) over a carved pointer."""
 
@@ -304,7 +318,9 @@ def build_mega_prefill(*, model_dim, inter_dim, topk, experts, lag=2, grid=80, d
 
 
 @functools.lru_cache(maxsize=8)
-def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=160, dbg=0, fuse_sum=True, store_cache=18, gu_bn=128):
+def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=160, dbg=0, fuse_sum=True, store_cache=18, gu_bn=128, h_stride=None):
+    H_STRIDE = h_stride or (inter_dim + 127) // 128 * 128  # fp8 h row stride: whole cache lines
+    HS_STRIDE = 32  # one 128-byte line per route scale: no line is shared between blocks
     N1 = 2 * inter_dim
     import os as _os
     _os.environ["MOE_GATEUP_MIN_LDS"] = _os.environ.get("MEGA_LDS", str(30 * 1024))  # down carves ~29.7 KB
@@ -315,6 +331,8 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         XCD_GROUP=0,
     )
     _os.environ.pop("MOE_GATEUP_MIN_LDS", None)
+    _os.environ["MOE_DOWN_A_STRIDE"] = str(H_STRIDE)
+    _os.environ["MOE_DOWN_AS_STRIDE"] = str(HS_STRIDE)
     dn = _build_moe_gemm2_1x4(
         N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
         BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=256, stage="down", alg="prefill_1x4", E=experts,
@@ -322,6 +340,8 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         down_output_padding_bytes=0, METADATA_TILE_SIZE_M=64,
         _store_cache=store_cache if fuse_sum else 2,
     )
+    _os.environ.pop("MOE_DOWN_A_STRIDE", None)
+    _os.environ.pop("MOE_DOWN_AS_STRIDE", None)
     gu_block, GuStorage, dn_block = gu.block, gu.storage, dn.block
     NT = N1 // gu_bn  # gate-up N tiles per block
     LDS_PAD = 14 * 1024  # down carves ~29 KB from the start of the gate-up storage
@@ -340,14 +360,17 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
     ):
         tid = gpu.thread_idx.x
         sa = fx.SharedAllocator()
-        lds = sa.allocate(GuStorage)
         tick = sa.allocate(fx.Array[fx.Int32, 4, 16]).peek()
+        lds = sa.allocate(GuStorage)
         tick_v = tick.view(fx.make_layout(4, 1))
         lds_base = fx.recast_iter(fx.Int8, lds.sorted_lds.peek().ptr)
         ctl = fx.Int64(fx.ptrtoint(p_ctl))
         nv = fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0]
         nblk = nv // 64
         xcd = _xcc_id() & (_XCD - 1)
+        if const_expr(dbg & 4096):
+            if tid == 0:
+                _atomic_add(ctl + fx.Int64(240), arith_select(xcd == fx.Int32(gpu.block_idx.x) % _XCD, 0, 1))
         # blocks of this XCD: b = g * 64 + xcd * 8 + j for group g, j < 8
         full_groups = nblk // (_XCD * _GROUP)
         rem = nblk - full_groups * (_XCD * _GROUP)
@@ -355,18 +378,70 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         n_x = full_groups * _GROUP + tail
         lag_x = arith_min(fx.Int32(lag), n_x)
         n_gd = (NT + 1) * n_x
-        n_tasks = n_gd
+        n_tasks = n_gd if const_expr((dbg & 1024) == 0) else NT * n_x
 
         xq_view = fx.make_view(fx.recast_iter(FP8, fxh._as_ptr(p_xq)), fx.make_layout((M, K), (K, 1)))
         w13_it = fx.recast_iter(FP8, fxh._as_ptr(p_w13))
 
+        if const_expr(dbg & 16384):
+            # G-only ticket loop with the static loop's body (no branches)
+            if tid == 0:
+                tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+            gpu.barrier()
+            tq = _rfl(tick_v[0])
+            iq = fx.Int32(0)
+            while (tq < NT * n_x) & (iq < 1000000):
+                iq = iq + 1
+                lq = tq // NT
+                bq = (lq // _GROUP) * (_XCD * _GROUP) + xcd * _GROUP + lq % _GROUP
+                if tid == 0:
+                    _atomic_add(ctl + fx.Int64(262144 + xcd * 16384 + tq * 4), bq * 8 + tq % NT + 1)
+                if const_expr((dbg & 32768) == 0 or (dbg & 65536)):
+                    gu_block(lds, bq, tq % NT, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
+                             p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
+                             i64_h, i64_hscale, sync_before_gemm=True)
+                gpu.barrier()
+                if tid == 0:
+                    _atomic_add(ctl + fx.Int64(248), arith_select(tick_v[0] == tq, 0, 1))
+                    tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+                gpu.barrier()
+                tq = _rfl(tick_v[0])
+            n_tasks = n_tasks * 0
+        if const_expr(dbg & 256):
+            # static G-only schedule, no tickets: WG w takes (block, tile) w, w + grid, ...
+            st = fx.Int32(gpu.block_idx.x)
+            if const_expr(dbg & 8192):
+                sk = fx.Int32(0)
+                while sk < (st % 7) * 300:
+                    rocdl.s_sleep(8)
+                    sk = sk + 1
+            while st < nblk * NT:
+                gu_block(lds, st // NT, st % NT, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
+                         p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
+                         i64_h, i64_hscale, sync_before_gemm=True)
+                gpu.barrier()
+                st = st + grid
+            n_tasks = n_tasks * 0
+        # Static per-XCD schedule: rank r within this XCD (one atomic), wait until every WG
+        # registered, then tasks r, r + W, ... of this XCD's sequence (W = WGs on this XCD).
+        # Every WG is resident and a task only waits for earlier tasks, so it cannot deadlock.
         if tid == 0:
-            _atomic_add(ctl + fx.Int64(48 + (xcd & 3) * 4), 1)
-            tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+            tick_v[0] = _atomic_add(ctl + fx.Int64(48 + xcd * 4), 1)
+            _atomic_add(ctl + fx.Int64(16), 1)
+        if tid < 64:
+            creg = _load_volatile(ctl + fx.Int64(16))
+            while creg < grid:
+                rocdl.s_sleep(1)
+                creg = _load_volatile(ctl + fx.Int64(16))
+            if tid == 0:
+                tick_v[1] = _load_volatile(ctl + fx.Int64(48 + xcd * 4))
         gpu.barrier()
-        t = tick_v[0]
+        t = _rfl(tick_v[0])
+        W = _rfl(tick_v[1])
         n_dn = fx.Int32(0)
-        while t < n_tasks:
+        iters = fx.Int32(0)
+        while (t < n_tasks) & (iters < 1000000):
+            iters = iters + 1
             # tickets: G(0..lag-1, all tiles) | [D(i), G(i+lag, tiles)] ... | last downs
             u = t - NT * lag_x
             pair_end = (NT + 1) * (n_x - lag_x)
@@ -376,6 +451,10 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                 in_pairs, arith_select(u % (NT + 1) == 0, u // (NT + 1), u // (NT + 1) + lag_x),
                 n_x - lag_x + (u - pair_end))))
             tile = fx.Int32(arith_select(t < NT * lag_x, t % NT, u % (NT + 1) - 1))
+            if const_expr(dbg & 1024):
+                is_down = t < 0
+                loc = t // NT
+                tile = t % NT
             b = (loc // _GROUP) * (_XCD * _GROUP) + xcd * _GROUP + loc % _GROUP
             is_sum = t < 0
             if is_down & (dbg != 2) & (dbg != 3):
@@ -388,36 +467,36 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                         cur = _load_volatile(ctl + fx.Int64(64 + b * 4))
                     if spins >= _SPIN_MAX:
                         _atomic_add(ctl + fx.Int64(40), 1)
-                    _fence(llvm.AtomicOrdering.acquire)
+                    _acq(dbg)
                 gpu.barrier()
                 _quant_block(b, tid, M, p_sorted_ids, p_hbf, i64_h, i64_hscale)
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
-                _inv_l1()
+                _inv(dbg)
                 dn_block(b, p_h, p_w2, p_gemm2_out, p_sorted_ids,
                          p_sorted_weights, p_seid, p_s2, p_hscale, M, _carver(lds_base))
                 n_dn = n_dn + 1
             if (is_down == False) & (is_sum == False) & (dbg != 3) & (dbg != 7) & ((dbg != 5) | (t == 0)):  # noqa: E712
-                gu_block(lds, b, tile, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
-                         p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
-                         i64_h, i64_hscale, sync_before_gemm=True)
+                if const_expr((dbg & (256 | 16384)) == 0):
+                    gu_block(lds, b, tile, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
+                             p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
+                             i64_h, i64_hscale, sync_before_gemm=True)
                 if const_expr(dbg & 64):
                     if tid == 0:
                         _atomic_add(ctl + fx.Int64(65536 + (b * NT + tile) * 8), _hw_id())
                         _atomic_add(ctl + fx.Int64(65540 + (b * NT + tile) * 8),
                                     fx.Int32(gpu.block_idx.x) + 1)
+                        _atomic_add(ctl + fx.Int64(131072 + (b * NT + tile) * 4), 1)
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
                 if tid == 0:
-                    _fence(llvm.AtomicOrdering.release)
+                    if const_expr((dbg & 512) == 0):
+                        _fence(llvm.AtomicOrdering.release)
                     _atomic_add(ctl + fx.Int64(64 + b * 4), 1)
             gpu.barrier()
-            if tid == 0:
-                tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
-            gpu.barrier()
-            t = tick_v[0]
+            t = t + W
 
-        if const_expr(fuse_sum):
+        if const_expr(fuse_sum and (dbg & 2048) == 0):
             # publish this WG's downs once, then wait for every down (all XCDs) to land
             rocdl.s_waitcnt(0)
             gpu.barrier()
@@ -433,7 +512,11 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                     cur = _load_volatile(ctl + fx.Int64(32))
                 if spins >= _SPIN_MAX:
                     _atomic_add(ctl + fx.Int64(44), 1)
-                _fence(llvm.AtomicOrdering.acquire)
+                _acq(dbg)
+            gpu.barrier()
+            # g2 rows come from every XCD (write-through stores); drop any line this XCD's L2
+            # still holds for those addresses (e.g. from an earlier launch) before reading them
+            _inv_l1_l2()
             gpu.barrier()
             wg = fx.Int32(gpu.block_idx.x)
             chunks = (M + 3) // 4
@@ -459,9 +542,9 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         hb_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(fx.ptrtoint(p_hbf)), num_records_bytes=fx.Int64(M) * fx.Int64(topk * inter * 2))
         q_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            i64_q, num_records_bytes=fx.Int64(M) * fx.Int64(topk * inter))
+            i64_q, num_records_bytes=fx.Int64(M) * fx.Int64(topk * H_STRIDE))
         s_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            i64_qs, num_records_bytes=fx.Int64(M) * fx.Int64(topk * 4))
+            i64_qs, num_records_bytes=fx.Int64(M) * fx.Int64(topk * 4 * HS_STRIDE))
         f32 = T.f32
         vals = []
         amax = fx.Float32(0.0)
@@ -477,7 +560,7 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
             amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(64)))
         scale = amax * fx.Float32(float(1.0 / 240.0))
         inv_scale = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
-        buffer_ops.buffer_store(_raw(scale), s_rsrc, route * fx.Int32(4),
+        buffer_ops.buffer_store(_raw(scale), s_rsrc, route * fx.Int32(4 * HS_STRIDE),
                                 mask=_raw((quarter == fx.Int32(0)) & valid), offset_is_bytes=True)
         fm_fast = fx.arith.FastMathFlags.fast
         for sl in range(inter // 32):
@@ -489,7 +572,7 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                 lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd]), _raw(q[4 * wd + 1]), fx.Int32(0), False)
                 words.append(rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd + 2]), _raw(q[4 * wd + 3]), lo, True))
             vec2 = vector.from_elements(T.vec(2, T.i32), words)
-            buffer_ops.buffer_store(vec2, q_rsrc, route * inter + sl * 32 + quarter * 8,
+            buffer_ops.buffer_store(vec2, q_rsrc, route * H_STRIDE + sl * 32 + quarter * 8,
                                     mask=_raw(valid), offset_is_bytes=True)
 
     def _sum_tokens(chunk, tid, M, p_loc, p_g2, p_out):

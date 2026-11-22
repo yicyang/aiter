@@ -56,6 +56,9 @@ def _build_moe_gemm2_1x4(
     _store_cache=_DOWN_STORE_CACHE_MODIFIER,
 ):
     PREFETCH_TILE = os.environ.get("MOE_DOWN_PREFETCH_TILE", "0") == "1"
+    # Row stride of the fp8 A rows (elements); > K keeps each route row on its own cache lines.
+    A_ROW_STRIDE = int(os.environ.get("MOE_DOWN_A_STRIDE", "0")) or K
+    A_SCALE_STRIDE = int(os.environ.get("MOE_DOWN_AS_STRIDE", "0")) or 1
     assert stage == "down"
     assert down_path == "1x4_64x256"
     # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
@@ -277,7 +280,13 @@ def _build_moe_gemm2_1x4(
         if const_expr(_task_table):
             row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
         # 1. 建立当前expert任务的输入、输出、sorted metadata和weight视图。
-        arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
+        if const_expr(A_ROW_STRIDE == K):
+            arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
+        else:
+            arg_p_input = fx.make_view(
+                fxh._as_ptr(p_input, weight_dtype),
+                fx.make_layout((M, TOPK, K), (TOPK * A_ROW_STRIDE, A_ROW_STRIDE, 1)),
+            )
         arg_p_output = fxh.view_as_torch_tensor(
             fxh._as_ptr(p_output, fx.BFloat16)
             + (
@@ -374,7 +383,7 @@ def _build_moe_gemm2_1x4(
             arg_p_input,
             max_size=False,
             num_records_bytes=fx.Int64(M)
-            * (TOPK * K)
+            * (TOPK * A_ROW_STRIDE)
             * (arg_p_input.dtype.width // 8),
         )
         cp_atom = down_ops.get_buffer_copy_atom(arg_p_input.dtype, 128)
@@ -509,13 +518,13 @@ def _build_moe_gemm2_1x4(
         if const_expr(act_quant_type == "ptpc"):
             arg_a_scale = fx.make_view(
                 fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
-                fx.make_layout((M, TOPK), (TOPK, 1)),
+                fx.make_layout((M, TOPK), (TOPK * A_SCALE_STRIDE, A_SCALE_STRIDE)),
             )
             arg_a_scale = fx.rocdl.make_buffer_tensor(
                 arg_a_scale,
                 max_size=False,
                 num_records_bytes=fx.Int64(M)
-                * TOPK
+                * (TOPK * A_SCALE_STRIDE)
                 * (arg_a_scale.dtype.width // 8),
             )
 
