@@ -2637,6 +2637,9 @@ def _build_moe_gemm1(
         ).launch(grid=(num_n_blocks, task_num, 1), block=(256, 1, 1), stream=stream)
 
     if const_expr(alg == "prefill_1x4"):
+        # For the persistent mega kernel: the block body and its LDS layout.
+        launch_prefill_1x4.block = gateup_prefill_block
+        launch_prefill_1x4.storage = SharedStorage
         return launch_prefill_1x4
     if const_expr(alg == "batch1"):
         return launch_batch1
