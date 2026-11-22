@@ -20,6 +20,18 @@ from . import common as fxh
 from .common import get_device_cache_key
 
 
+def _scf_if_then(cond, then_fn):
+    """`if cond: then_fn()` for helpers the AST rewriter does not see."""
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import scf as _scf
+    from flydsl.expr.utils.arith import _to_raw
+
+    op = _scf.IfOp(_to_raw(cond), [], has_else=False)
+    with _ir.InsertionPoint(op.then_block):
+        then_fn()
+        _scf.YieldOp([])
+
+
 def _build_moe_gemm1(
     N,
     K,
@@ -2256,6 +2268,195 @@ def _build_moe_gemm1(
                 )
                 buffer_ops.buffer_store(packed, q_rsrc, off, offset_is_bytes=True)
 
+    def gateup_prefill_block(
+        lds, e_idx, blk_n, tid, M, arg_p_input, p_weight, p_output, p_sorted_ids,
+        p_sorted_weights, p_sorted_expert_ids, p_w_scale, p_a_scale, situ_beta_f,
+        situ_beta_rcp_f, situ_linear_beta_f, situ_linear_beta_rcp_f, activation_limit_f,
+        i64_q_out, i64_q_scale,
+    ):
+        """One (expert block, N tile) of prefill_1x4 gate-up; plain helper (no AST rewrite),
+        shared by the per-block kernel and the persistent mega kernel."""
+        lds.sorted_lds = lds.sorted_lds.peek()
+        lds.gemm = lds.gemm.peek()
+        arg_p_sorted_ids = fx.make_view(
+            fx.recast_iter(
+                fx.Int32, fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M
+            ),
+            fx.make_layout(BLOCK_TILE_SIZE_M, 1),
+        )
+        arg_p_sorted_expert_ids = fx.recast_iter(
+            fx.Int32, fxh._as_ptr(p_sorted_expert_ids)
+        )
+        expert_id = arg_p_sorted_expert_ids[e_idx // gateup_tasks_per_metadata]
+
+        contiguous_n = BLOCK_TILE_SIZE_N // 2
+        arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
+
+        sorted_ids_buf = fx.rocdl.make_buffer_tensor(
+            arg_p_sorted_ids, max_size=False
+        )
+        def _fill_sorted_lds():
+            lds_view = fx.make_view(
+                lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
+            )
+            lds_view[tid] = sorted_ids_buf[tid]
+
+        _scf_if_then(tid < BLOCK_TILE_SIZE_M, _fill_sorted_lds)
+        gpu.barrier()
+
+        # Output [M, TOPK, N//2] + the per-row scatter index, built BEFORE gemm_1x4:
+        # sorted_lds is unioned with a_ping, so c_out must seed its index_frag from
+        # sorted_lds now; gemm_1x4 then overwrites that LDS region with the A tile.
+        arg_p_output = fx.make_view(
+            fxh._as_ptr(p_output),
+            fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
+        )
+        out_tensor = fx.rocdl.make_buffer_tensor(
+            arg_p_output,
+            max_size=False,
+            num_records_bytes=fx.Int64(M)
+            * (TOPK * N // 2 * fx.BFloat16.width // 8),
+        )
+        buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
+        # 4-wave 2x2 thread grid (token = lane//4 + 16*waveM, 8 contiguous channels/lane,
+        # 128b), decoupled from the gemm's 1x4 wave layout (it just walks the staged LDS),
+        # so rep_token = BM//32 and rep_channel = contiguous_n//64.
+        c_rw_copy = fx.make_tiled_copy(
+            buf_atom_w128,
+            fx.make_layout(((4, 16, 2, 2), 8), ((256, 1, 16, 1024), 32)),
+            fx.make_tile(32, 64),
+        )
+        c_index_copy = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
+            fx.make_layout(((4, 16, 2, 2), 1), ((0, 1, 16, 0), 0)),
+            fx.make_tile(32),
+        )
+        c_out_index_frag = _read_sorted_index(c_index_copy, tid, lds.sorted_lds)
+        c_out = TensorWithIndex(
+            out_tensor,
+            BLOCK_TILE_SIZE_M,
+            contiguous_n,
+            c_out_index_frag,
+            c_rw_copy,
+            tid,
+            is_read_from_mem=False,
+            TOPK=TOPK,
+        )
+
+        # ptpc a_scale is per-token; B-first packs 4 CONTIGUOUS channels per lane in the
+        # value dim, so token = lane%16 + 16*token_rep (one id per token_rep, shared by
+        # the 4 channel values). Gather the per-token_rep sorted id here, before gemm_1x4
+        # overwrites sorted_lds.
+        asc_idx = None
+        if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
+            asc_index_copy = fx.make_tiled_copy(
+                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
+                fx.make_layout(((16, 4, 4), 1), ((1, 0, 0), 0)),
+                fx.make_tile(16),
+            )
+            cp_atom_idx = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+            asc_lds = fx.make_view(
+                lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
+            )
+            asc_thr = asc_index_copy.get_slice(tid).partition_S(asc_lds)
+            asc_idx = fx.make_fragment_like(asc_thr)
+            fx.copy(cp_atom_idx, asc_thr, asc_idx)
+
+        def gemm_and_epilogue(n_active):
+            c_gate_frag, c_up_frag = gemm_1x4(
+                BLOCK_TILE_SIZE_M,
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                arg_p_weight,
+                lds,
+                n_active=n_active,
+            )
+
+            if const_expr(weight_dtype != fx.BFloat16):
+                _apply_1x4_fp8_dequant(
+                    c_gate_frag,
+                    c_up_frag,
+                    tid,
+                    expert_id,
+                    blk_n,
+                    contiguous_n,
+                    asc_idx,
+                    M,
+                    p_w_scale,
+                    p_a_scale,
+                )
+
+            c_out_bf16 = _gateup_pair_bf16(
+                c_gate_frag,
+                c_up_frag,
+                situ_beta_f,
+                situ_beta_rcp_f,
+                situ_linear_beta_f,
+                situ_linear_beta_rcp_f,
+                activation_limit_f,
+            )
+
+            # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
+            # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
+            # the same 1x4 tiled_mma as _gemm_1x4. B-first makes the value dim 4 contiguous
+            # channels, so the store is 64-bit; read it back channel-contiguous (8 bf16/lane)
+            # so the scatter issues 128-bit writes.
+            _, _tiled_mma = _make_1x4_tiled_mma()
+            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+            # B-first: store through the (channel=M, token=N) transpose view so the value dim
+            # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
+            # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
+            # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
+            # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
+            # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
+            # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
+            # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
+            # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
+            swz_c = fx.SwizzleType.get(3, 3, 3)
+            lds_c_store = fx.make_view(
+                cshuf_ptr,
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout(
+                        (contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)
+                    ),
+                ),
+            )
+            lds_c = fx.make_view(
+                cshuf_ptr,
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout(
+                        (BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)
+                    ),
+                ),
+            )
+
+            gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
+            store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
+            fx.copy(
+                cshuf_atom_w,
+                store_c.retile(c_out_bf16),
+                store_c.partition_D(lds_c_store),
+            )
+            gpu.barrier()
+            if const_expr(FUSE_QUANT):
+                _quant_rows_epilogue(
+                    lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale
+                )
+            else:
+                rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
+                fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
+                c_out.copy(buf_atom_w128, blk_n, rd)
+
+        gemm_and_epilogue(None)
+
+
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
         p_input: fx.Pointer,  # bf16 or native-fp8 [M, K]
@@ -2306,199 +2507,12 @@ def _build_moe_gemm1(
             p_weight = fx.recast_iter(weight_dtype, fxh._as_ptr(p_weight))
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
             lds = fx.SharedAllocator().allocate(SharedStorage)
-            lds.sorted_lds = lds.sorted_lds.peek()
-            lds.gemm = lds.gemm.peek()
-            arg_p_sorted_ids = fx.make_view(
-                fx.recast_iter(
-                    fx.Int32, fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M
-                ),
-                fx.make_layout(BLOCK_TILE_SIZE_M, 1),
+            gateup_prefill_block(
+                lds, e_idx, blk_n, tid, M, arg_p_input, p_weight, p_output, p_sorted_ids,
+                p_sorted_weights, p_sorted_expert_ids, p_w_scale, p_a_scale, situ_beta_f,
+                situ_beta_rcp_f, situ_linear_beta_f, situ_linear_beta_rcp_f, activation_limit_f,
+                i64_q_out, i64_q_scale,
             )
-            arg_p_sorted_expert_ids = fx.recast_iter(
-                fx.Int32, fxh._as_ptr(p_sorted_expert_ids)
-            )
-            expert_id = arg_p_sorted_expert_ids[e_idx // gateup_tasks_per_metadata]
-
-            contiguous_n = BLOCK_TILE_SIZE_N // 2
-            arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
-
-            sorted_ids_buf = fx.rocdl.make_buffer_tensor(
-                arg_p_sorted_ids, max_size=False
-            )
-            if tid < BLOCK_TILE_SIZE_M:
-                lds_view = fx.make_view(
-                    lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
-                )
-                lds_view[tid] = sorted_ids_buf[tid]
-            gpu.barrier()
-
-            # Output [M, TOPK, N//2] + the per-row scatter index, built BEFORE gemm_1x4:
-            # sorted_lds is unioned with a_ping, so c_out must seed its index_frag from
-            # sorted_lds now; gemm_1x4 then overwrites that LDS region with the A tile.
-            arg_p_output = fx.make_view(
-                fxh._as_ptr(p_output),
-                fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
-            )
-            out_tensor = fx.rocdl.make_buffer_tensor(
-                arg_p_output,
-                max_size=False,
-                num_records_bytes=fx.Int64(M)
-                * (TOPK * N // 2 * fx.BFloat16.width // 8),
-            )
-            buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
-            # 4-wave 2x2 thread grid (token = lane//4 + 16*waveM, 8 contiguous channels/lane,
-            # 128b), decoupled from the gemm's 1x4 wave layout (it just walks the staged LDS),
-            # so rep_token = BM//32 and rep_channel = contiguous_n//64.
-            c_rw_copy = fx.make_tiled_copy(
-                buf_atom_w128,
-                fx.make_layout(((4, 16, 2, 2), 8), ((256, 1, 16, 1024), 32)),
-                fx.make_tile(32, 64),
-            )
-            c_index_copy = fx.make_tiled_copy(
-                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                fx.make_layout(((4, 16, 2, 2), 1), ((0, 1, 16, 0), 0)),
-                fx.make_tile(32),
-            )
-            c_out_index_frag = _read_sorted_index(c_index_copy, tid, lds.sorted_lds)
-            c_out = TensorWithIndex(
-                out_tensor,
-                BLOCK_TILE_SIZE_M,
-                contiguous_n,
-                c_out_index_frag,
-                c_rw_copy,
-                tid,
-                is_read_from_mem=False,
-                TOPK=TOPK,
-            )
-
-            # ptpc a_scale is per-token; B-first packs 4 CONTIGUOUS channels per lane in the
-            # value dim, so token = lane%16 + 16*token_rep (one id per token_rep, shared by
-            # the 4 channel values). Gather the per-token_rep sorted id here, before gemm_1x4
-            # overwrites sorted_lds.
-            asc_idx = None
-            if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
-                asc_index_copy = fx.make_tiled_copy(
-                    fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                    fx.make_layout(((16, 4, 4), 1), ((1, 0, 0), 0)),
-                    fx.make_tile(16),
-                )
-                cp_atom_idx = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
-                asc_lds = fx.make_view(
-                    lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
-                )
-                asc_thr = asc_index_copy.get_slice(tid).partition_S(asc_lds)
-                asc_idx = fx.make_fragment_like(asc_thr)
-                fx.copy(cp_atom_idx, asc_thr, asc_idx)
-
-            def gemm_and_epilogue(n_active):
-                c_gate_frag, c_up_frag = gemm_1x4(
-                    BLOCK_TILE_SIZE_M,
-                    BLOCK_TILE_SIZE_N,
-                    TILE_K,
-                    blk_n,
-                    arg_p_input,
-                    arg_p_weight,
-                    lds,
-                    n_active=n_active,
-                )
-
-                if const_expr(weight_dtype != fx.BFloat16):
-                    _apply_1x4_fp8_dequant(
-                        c_gate_frag,
-                        c_up_frag,
-                        tid,
-                        expert_id,
-                        blk_n,
-                        contiguous_n,
-                        asc_idx,
-                        M,
-                        p_w_scale,
-                        p_a_scale,
-                    )
-
-                c_out_bf16 = _gateup_pair_bf16(
-                    c_gate_frag,
-                    c_up_frag,
-                    situ_beta_f,
-                    situ_beta_rcp_f,
-                    situ_linear_beta_f,
-                    situ_linear_beta_rcp_f,
-                    activation_limit_f,
-                )
-
-                # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
-                # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
-                # the same 1x4 tiled_mma as _gemm_1x4. B-first makes the value dim 4 contiguous
-                # channels, so the store is 64-bit; read it back channel-contiguous (8 bf16/lane)
-                # so the scatter issues 128-bit writes.
-                _, _tiled_mma = _make_1x4_tiled_mma()
-                cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-                cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-                cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
-                # B-first: store through the (channel=M, token=N) transpose view so the value dim
-                # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
-                # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
-                # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
-                # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
-                # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
-                # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
-                # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
-                # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
-                swz_c = fx.SwizzleType.get(3, 3, 3)
-                lds_c_store = fx.make_view(
-                    cshuf_ptr,
-                    fx.make_composed_layout(
-                        fx.static(swz_c),
-                        fx.make_ordered_layout(
-                            (contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)
-                        ),
-                    ),
-                )
-                lds_c = fx.make_view(
-                    cshuf_ptr,
-                    fx.make_composed_layout(
-                        fx.static(swz_c),
-                        fx.make_ordered_layout(
-                            (BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)
-                        ),
-                    ),
-                )
-
-                gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
-                store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
-                fx.copy(
-                    cshuf_atom_w,
-                    store_c.retile(c_out_bf16),
-                    store_c.partition_D(lds_c_store),
-                )
-                gpu.barrier()
-                if const_expr(FUSE_QUANT):
-                    _quant_rows_epilogue(
-                        lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale
-                    )
-                else:
-                    rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
-                    fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-                    c_out.copy(buf_atom_w128, blk_n, rd)
-
-            if const_expr(SKIP_PAD and BLOCK_TILE_SIZE_M == 64):
-                # Rows of a block are its expert's routes, padding last; skip the 16-row
-                # token sub-tiles 2-3 when row 32 is already padding.
-                row32 = sorted_ids_buf[32]
-                if (row32 & 0xFFFFFF) < M:
-                    gemm_and_epilogue(None)
-                else:
-                    if const_expr(SKIP_PAD_ONE):
-                        row16 = sorted_ids_buf[16]
-                        if (row16 & 0xFFFFFF) < M:
-                            gemm_and_epilogue(2)
-                        else:
-                            gemm_and_epilogue(1)
-                    else:
-                        gemm_and_epilogue(2)
-            else:
-                gemm_and_epilogue(None)
 
     @flyc.jit
     def launch_splitk(
