@@ -15,9 +15,10 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from .. import buffer_ops
@@ -81,6 +82,16 @@ def _wg_sync():
     llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
     gpu.barrier()
     llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+
+
+def _inv_l1():
+    llvm.InlineAsmOp(None, [], "buffer_inv sc0", "", has_side_effects=True)
+
+
+def _hw_id():
+    v = llvm.InlineAsmOp(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_HW_ID)", "=s",
+                         has_side_effects=True).result
+    return fx.Int32(v)
 
 
 class _Carved:
@@ -290,6 +301,247 @@ def build_mega_prefill(*, model_dim, inter_dim, topk, experts, lag=2, grid=80, d
     return launch
 
 
+
+
+@functools.lru_cache(maxsize=8)
+def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=160, dbg=0, fuse_sum=True, store_cache=18, gu_bn=128):
+    N1 = 2 * inter_dim
+    import os as _os
+    _os.environ["MOE_GATEUP_MIN_LDS"] = _os.environ.get("MEGA_LDS", str(30 * 1024))  # down carves ~29.7 KB
+    gu = compile_moe_gemm1(
+        N=N1, K=model_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=gu_bn, tile_k=128, alg="prefill_1x4", E=experts,
+        act_quant_type="ptpc", activation="silu", METADATA_TILE_SIZE_M=64, FUSE_QUANT=False,
+        XCD_GROUP=0,
+    )
+    _os.environ.pop("MOE_GATEUP_MIN_LDS", None)
+    dn = _build_moe_gemm2_1x4(
+        N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=256, stage="down", alg="prefill_1x4", E=experts,
+        USE_ATOMIC_WRITE=False, act_quant_type="ptpc", down_path="1x4_64x256",
+        down_output_padding_bytes=0, METADATA_TILE_SIZE_M=64,
+        _store_cache=store_cache if fuse_sum else 2,
+    )
+    gu_block, GuStorage, dn_block = gu.block, gu.storage, dn.block
+    NT = N1 // gu_bn  # gate-up N tiles per block
+    LDS_PAD = 14 * 1024  # down carves ~29 KB from the start of the gate-up storage
+    K = model_dim
+    FP8 = fx.Float8E4M3FNUZ
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def mega_moe_prefill_v2(
+        p_xq: fx.Pointer, p_w13: fx.Pointer, p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer, p_seid: fx.Pointer, p_nv: fx.Pointer,
+        p_s13: fx.Pointer, p_xscale: fx.Pointer, M: fx.Int32,
+        sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32, alim: fx.Float32,
+        i64_h: fx.Int64, i64_hscale: fx.Int64, p_h: fx.Pointer, p_hscale: fx.Pointer,
+        p_w2: fx.Pointer, p_s2: fx.Pointer, p_gemm2_out: fx.Pointer, p_ctl: fx.Pointer,
+        p_loc: fx.Pointer, p_out: fx.Pointer, p_hbf: fx.Pointer,
+    ):
+        tid = gpu.thread_idx.x
+        sa = fx.SharedAllocator()
+        lds = sa.allocate(GuStorage)
+        tick = sa.allocate(fx.Array[fx.Int32, 4, 16]).peek()
+        tick_v = tick.view(fx.make_layout(4, 1))
+        lds_base = fx.recast_iter(fx.Int8, lds.sorted_lds.peek().ptr)
+        ctl = fx.Int64(fx.ptrtoint(p_ctl))
+        nv = fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0]
+        nblk = nv // 64
+        xcd = _xcc_id() & (_XCD - 1)
+        # blocks of this XCD: b = g * 64 + xcd * 8 + j for group g, j < 8
+        full_groups = nblk // (_XCD * _GROUP)
+        rem = nblk - full_groups * (_XCD * _GROUP)
+        tail = fx.Int32(arith_min(arith_max(rem - xcd * _GROUP, 0), _GROUP))
+        n_x = full_groups * _GROUP + tail
+        lag_x = arith_min(fx.Int32(lag), n_x)
+        n_gd = (NT + 1) * n_x
+        n_tasks = n_gd
+
+        xq_view = fx.make_view(fx.recast_iter(FP8, fxh._as_ptr(p_xq)), fx.make_layout((M, K), (K, 1)))
+        w13_it = fx.recast_iter(FP8, fxh._as_ptr(p_w13))
+
+        if tid == 0:
+            _atomic_add(ctl + fx.Int64(48 + (xcd & 3) * 4), 1)
+            tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+        gpu.barrier()
+        t = tick_v[0]
+        n_dn = fx.Int32(0)
+        while t < n_tasks:
+            # tickets: G(0..lag-1, all tiles) | [D(i), G(i+lag, tiles)] ... | last downs
+            u = t - NT * lag_x
+            pair_end = (NT + 1) * (n_x - lag_x)
+            in_pairs = (t >= NT * lag_x) & (u < pair_end)
+            is_down = (t >= NT * lag_x) & ((u >= pair_end) | (u % (NT + 1) == 0))
+            loc = fx.Int32(arith_select(t < NT * lag_x, t // NT, arith_select(
+                in_pairs, arith_select(u % (NT + 1) == 0, u // (NT + 1), u // (NT + 1) + lag_x),
+                n_x - lag_x + (u - pair_end))))
+            tile = fx.Int32(arith_select(t < NT * lag_x, t % NT, u % (NT + 1) - 1))
+            b = (loc // _GROUP) * (_XCD * _GROUP) + xcd * _GROUP + loc % _GROUP
+            is_sum = t < 0
+            if is_down & (dbg != 2) & (dbg != 3):
+                if (tid < 64) & (dbg != 1) & (dbg != 7):
+                    cur = _load_volatile(ctl + fx.Int64(64 + b * 4))
+                    spins = fx.Int32(0)
+                    while (cur < NT) & (spins < _SPIN_MAX):
+                        rocdl.s_sleep(1)
+                        spins = spins + 1
+                        cur = _load_volatile(ctl + fx.Int64(64 + b * 4))
+                    if spins >= _SPIN_MAX:
+                        _atomic_add(ctl + fx.Int64(40), 1)
+                    _fence(llvm.AtomicOrdering.acquire)
+                gpu.barrier()
+                _quant_block(b, tid, M, p_sorted_ids, p_hbf, i64_h, i64_hscale)
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
+                _inv_l1()
+                dn_block(b, p_h, p_w2, p_gemm2_out, p_sorted_ids,
+                         p_sorted_weights, p_seid, p_s2, p_hscale, M, _carver(lds_base))
+                n_dn = n_dn + 1
+            if (is_down == False) & (is_sum == False) & (dbg != 3) & (dbg != 7) & ((dbg != 5) | (t == 0)):  # noqa: E712
+                gu_block(lds, b, tile, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
+                         p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
+                         i64_h, i64_hscale, sync_before_gemm=True)
+                if const_expr(dbg & 64):
+                    if tid == 0:
+                        _atomic_add(ctl + fx.Int64(65536 + (b * NT + tile) * 8), _hw_id())
+                        _atomic_add(ctl + fx.Int64(65540 + (b * NT + tile) * 8),
+                                    fx.Int32(gpu.block_idx.x) + 1)
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
+                if tid == 0:
+                    _fence(llvm.AtomicOrdering.release)
+                    _atomic_add(ctl + fx.Int64(64 + b * 4), 1)
+            gpu.barrier()
+            if tid == 0:
+                tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+            gpu.barrier()
+            t = tick_v[0]
+
+        if const_expr(fuse_sum):
+            # publish this WG's downs once, then wait for every down (all XCDs) to land
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
+            if tid == 0:
+                _fence(llvm.AtomicOrdering.release)
+                _atomic_add(ctl + fx.Int64(32), n_dn)
+            if (tid == 0) & (dbg != 8):
+                cur = _load_volatile(ctl + fx.Int64(32))
+                spins = fx.Int32(0)
+                while (cur < nblk) & (spins < _SPIN_MAX):
+                    rocdl.s_sleep(1)
+                    spins = spins + 1
+                    cur = _load_volatile(ctl + fx.Int64(32))
+                if spins >= _SPIN_MAX:
+                    _atomic_add(ctl + fx.Int64(44), 1)
+                _fence(llvm.AtomicOrdering.acquire)
+            gpu.barrier()
+            wg = fx.Int32(gpu.block_idx.x)
+            chunks = (M + 3) // 4
+            c0 = wg * chunks // grid
+            c1 = (wg + 1) * chunks // grid
+            c = c0
+            while c < c1:
+                _sum_tokens(c, tid, M, p_loc, p_gemm2_out, p_out)
+                c = c + 1
+
+    def _quant_block(b, tid, M, p_sid, p_hbf, i64_q, i64_qs):
+        # Per-route fp8 quant of block b's 64 bf16 h rows, the math of the fused gate-up
+        # epilogue (gemm1 _quant_rows_epilogue): 4 lanes per row, 8 channels per 32-channel
+        # slice each, amax over the row, scale = amax / 240, q = clamp(x * rcp(scale)).
+        inter = inter_dim
+        quarter = tid % 4
+        row = tid // 4
+        sid = fx.Int32(p_sid[b * 64 + row])
+        token = sid & fx.Int32(0xFFFFFF)
+        slot = sid >> fx.Int32(24)
+        valid = token < M
+        route = valid.select(token * topk + slot, fx.Int32(0))
+        hb_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(fx.ptrtoint(p_hbf)), num_records_bytes=fx.Int64(M) * fx.Int64(topk * inter * 2))
+        q_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            i64_q, num_records_bytes=fx.Int64(M) * fx.Int64(topk * inter))
+        s_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            i64_qs, num_records_bytes=fx.Int64(M) * fx.Int64(topk * 4))
+        f32 = T.f32
+        vals = []
+        amax = fx.Float32(0.0)
+        for sl in range(inter // 32):
+            off = (route * inter + sl * 32 + quarter * 8) // 2  # in i32 words
+            w4 = Vec(buffer_ops.buffer_load(hb_rsrc, off, vec_width=4, dtype=T.i32))
+            v8 = w4.bitcast(fx.BFloat16)
+            f8 = [v8[j].to(fx.Float32) for j in range(8)]
+            for j in range(8):
+                amax = amax.maximumf(fx.Float32(llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(f8[j])], [], [])))
+            vals.append(f8)
+        for dist in (1, 2):
+            amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(64)))
+        scale = amax * fx.Float32(float(1.0 / 240.0))
+        inv_scale = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
+        buffer_ops.buffer_store(_raw(scale), s_rsrc, route * fx.Int32(4),
+                                mask=_raw((quarter == fx.Int32(0)) & valid), offset_is_bytes=True)
+        fm_fast = fx.arith.FastMathFlags.fast
+        for sl in range(inter // 32):
+            f8 = vals[sl]
+            q = [fx.math.clampf(f8[j] * inv_scale, fx.Float32(-240.0), fx.Float32(240.0), fastmath=fm_fast)
+                 for j in range(8)]
+            words = []
+            for wd in range(2):
+                lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd]), _raw(q[4 * wd + 1]), fx.Int32(0), False)
+                words.append(rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd + 2]), _raw(q[4 * wd + 3]), lo, True))
+            vec2 = vector.from_elements(T.vec(2, T.i32), words)
+            buffer_ops.buffer_store(vec2, q_rsrc, route * inter + sl * 32 + quarter * 8,
+                                    mask=_raw(valid), offset_is_bytes=True)
+
+    def _sum_tokens(chunk, tid, M, p_loc, p_g2, p_out):
+        # Same math and order as moe_reduce.sorted_sum: f32 sum over the TOPK routes in slot
+        # order (merged routes have loc -1), then one conversion to bf16. One wave per token.
+        lane = tid % 64
+        tok = chunk * 4 + tid // 64
+        tok_c = arith_min(tok, M - 1)
+        locs = [p_loc[tok_c * topk + k] for k in range(topk)]
+        valid = [loc >= 0 for loc in locs]
+        g2 = fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_g2))
+        rows = [g2 + fx.Int64(valid[k].select(locs[k], 0)) * model_dim for k in range(topk)]
+        copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
+        copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy(128), fx.BFloat16)
+        out_row = fx.make_view(fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_out)) + fx.Int64(tok) * model_dim,
+                               fx.make_layout(model_dim, 1))
+        out_buf = fx.rocdl.make_buffer_tensor(
+            out_row, max_size=False,
+            num_records_bytes=(tok < M).select(fx.Int32(model_dim * 2), fx.Int32(0)))
+        n_chunk = model_dim // 8 // 64
+        for i in range(n_chunk):  # 2 waves/SIMD: one column chunk (11 loads) at a time
+            col = (lane + 64 * i) * 8
+            frags_i = []
+            for k in range(topk):
+                atom = fx.make_view(rows[k] + col, fx.make_layout(8, 1))
+                frag = fx.make_fragment_like(atom)
+                fx.copy(copy_atom, atom, frag)
+                frags_i.append(frag)
+            acc = valid[0].select(frags_i[0].load().to(fx.Float32), 0.0)
+            for k in range(1, topk):
+                acc += valid[k].select(frags_i[k].load().to(fx.Float32), 0.0)
+            dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
+            of = fx.make_fragment_like(dst)
+            of.store(acc.to(fx.BFloat16))
+            fx.copy(copy_atom_b, of, dst)
+
+    @flyc.jit
+    def launch(p_xq: fx.Pointer, p_w13: fx.Pointer, p_sorted_ids: fx.Pointer,
+               p_sorted_weights: fx.Pointer, p_seid: fx.Pointer, p_nv: fx.Pointer,
+               p_s13: fx.Pointer, p_xscale: fx.Pointer, M: fx.Int32,
+               sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
+               alim: fx.Float32, i64_h: fx.Int64, i64_hscale: fx.Int64,
+               p_h: fx.Pointer, p_hscale: fx.Pointer, p_w2: fx.Pointer, p_s2: fx.Pointer,
+               p_gemm2_out: fx.Pointer, p_ctl: fx.Pointer, p_loc: fx.Pointer, p_out: fx.Pointer,
+               p_hbf: fx.Pointer, stream: fx.Stream):
+        mega_moe_prefill_v2(p_xq, p_w13, p_sorted_ids, p_sorted_weights, p_seid, p_nv, p_s13,
+                         p_xscale, M, sb, sbr, slb, slbr, alim, i64_h, i64_hscale, p_h, p_hscale, p_w2, p_s2,
+                         p_gemm2_out, p_ctl, p_loc, p_out, p_hbf,
+                         value_attrs={"rocdl.waves_per_eu": 2},
+                         ).launch(grid=(grid, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch
 
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_2e(*, model_dim, inter_dim, topk, experts, lag=2, grid=80, dbg=0, fuse_sum=True, store_cache=18):

@@ -66,6 +66,8 @@ def _build_moe_gemm1(
     else:
         XCD_REMAP = alg == "prefill_1x4" and XCD_GROUP > 0
     SKIP_PAD = alg == "prefill_1x4" and os.environ.get("MOE_GATEUP_SKIP_PAD", "0") == "1"
+    # A persistent kernel that reuses this storage for other tasks can ask for more LDS.
+    MIN_LDS_BYTES = int(os.environ.get("MOE_GATEUP_MIN_LDS", "0"))
     SKIP_PAD_ONE = os.environ.get("MOE_GATEUP_SKIP_PAD_ONE", "0") == "1"
     if FUSE_QUANT:
         assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
@@ -233,7 +235,7 @@ def _build_moe_gemm1(
 
         _a_bytes = 2 * a_lds_size * (1 if weight_dtype == "fp8" else 2)
         _cshuffle_need = BLOCK_TILE_SIZE_M * (BLOCK_TILE_SIZE_N // 2) * 2
-        _pad_bytes = max(0, _cshuffle_need - _a_bytes)
+        _pad_bytes = max(0, _cshuffle_need - _a_bytes, MIN_LDS_BYTES - _a_bytes)
 
         @fx.struct
         class GemmBuffers:
@@ -2272,7 +2274,7 @@ def _build_moe_gemm1(
         lds, e_idx, blk_n, tid, M, arg_p_input, p_weight, p_output, p_sorted_ids,
         p_sorted_weights, p_sorted_expert_ids, p_w_scale, p_a_scale, situ_beta_f,
         situ_beta_rcp_f, situ_linear_beta_f, situ_linear_beta_rcp_f, activation_limit_f,
-        i64_q_out, i64_q_scale,
+        i64_q_out, i64_q_scale, sync_before_gemm=False,
     ):
         """One (expert block, N tile) of prefill_1x4 gate-up; plain helper (no AST rewrite),
         shared by the per-block kernel and the persistent mega kernel."""
@@ -2364,6 +2366,9 @@ def _build_moe_gemm1(
             fx.copy(cp_atom_idx, asc_thr, asc_idx)
 
         def gemm_and_epilogue(n_active):
+            if const_expr(sync_before_gemm):
+                # a_ping aliases sorted_lds: every wave must have read its indices first
+                gpu.barrier()
             c_gate_frag, c_up_frag = gemm_1x4(
                 BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N,
