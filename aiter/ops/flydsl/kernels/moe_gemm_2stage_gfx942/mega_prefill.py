@@ -138,6 +138,10 @@ def _lds_st(base_i64, off, val):
     llvm.StoreOp(_raw(fx.Int32(val)), _lds_ptr3(base_i64, off), alignment=4)
 
 
+def _lds_ld_volatile(base_i64, off):
+    return fx.Int32(llvm.LoadOp(T.i32, _lds_ptr3(base_i64, off), alignment=4, volatile_=True).result)
+
+
 class _Carved:
     """Stands in for a SharedAllocator storage: .peek().view(layout) over a carved pointer."""
 
@@ -1136,7 +1140,8 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
-                          push=False, prof=False, fuse_xq=False, fuse_sort=False):
+                          push=False, prof=False, fuse_xq=False, fuse_sort=False,
+                          skip_pad=False, sa_delay=0, dyn=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1523,7 +1528,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         nA_x = fgA * _GROUP + fx.Int32(arith_min(arith_max(remA - xcd * _GROUP, 0), _GROUP))
         n_tasks = 2 * n_x
         T_A = arith_select(nA_x == 0, -1, n_x + nA_x - 1)  # this queue's last A down
-        t = _rfl(tick_v[0])
+        if const_expr(dyn):
+            # dynamic tickets from this XCD's queue (ctl[24 + xcd])
+            if tid == 0:
+                tick_v[2] = _atomic_add(ctl + fx.Int64(96 + xcd * 4), 1)
+            gpu.barrier()
+        tick_base = fx.Int64(fx.ptrtoint(tick.ptr))
+        t = _rfl(_lds_ld_volatile(tick_base, 8 if dyn else 0))
         W = _rfl(tick_v[1])
         _tk = _memtime_lo()
         n_dnA = fx.Int32(0)
@@ -1533,13 +1544,20 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         while ((t < n_tasks) | (sa_done == 0)) & (iters < 1000000):
             iters = iters + 1
             _t0 = _memtime_lo()
-            if ((t > T_A) | (t >= n_tasks)) & (sa_done == 0):
+            if ((t > T_A + sa_delay) | (t >= n_tasks)) & (sa_done == 0):
                 # every A task of this queue is taken: publish A downs, wait for all, sum A
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
+                _tw1 = _memtime_lo()
                 if tid == 0:
                     _fence(llvm.AtomicOrdering.release)
                     _atomic_add(ctl + fx.Int64(32), n_dnA)
+                gpu.barrier()
+                _tw2 = _memtime_lo()
+                if const_expr(prof):
+                    if tid == 0:
+                        _atomic_add(ctl + fx.Int64(65536 + 8192 + 4096 + wg * 16), _tw1 - _ts0)
+                        _atomic_add(ctl + fx.Int64(65536 + 8192 + 4096 + wg * 16 + 8), xcd)
                 n_dnA = n_dnA * 0
                 if tid < 64:
                     cA = _load_volatile(ctl + fx.Int64(32))
@@ -1553,6 +1571,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                 if const_expr(prof):
                     if tid == 0:
                         _atomic_add(ctl + fx.Int64(65536 + wg * 32 + 2 * 4), _memtime_lo() - _t0)
+                        _atomic_add(ctl + fx.Int64(65536 + 8192 + 4096 + wg * 16 + 4), _memtime_lo() - _ts0)
                 _t1 = _memtime_lo()
                 chA = (MA + 3) // 4
                 ca = wg * chA // grid
@@ -1599,10 +1618,16 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                     n_dnA = n_dnA + arith_select(b < nbA, 1, 0)
                     n_dnB = n_dnB + arith_select(b < nbA, 0, 1)
                 if is_down == False:  # noqa: E712
+                    n_sub = None
+                    if const_expr(skip_pad):
+                        n_sub = fx.Int32(1)
+                        for rq in (16, 32, 48):
+                            n_sub = n_sub + arith_select((fx.Int32(p_sid[b * 64 + rq]) & 0xFFFFFF) < M, 1, 0)
+                        n_sub = _rfl(n_sub)
                     for tl in range(NT):
                         gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw, p_seid,
                                  p_s13, p_xscale, sb, sbr, slb, slbr, alim, i64_h, i64_hs,
-                                 sync_before_gemm=True)
+                                 sync_before_gemm=True, n_sub_rt=n_sub)
                         gpu.barrier()
                     rocdl.s_waitcnt(0)
                     gpu.barrier()
@@ -1611,7 +1636,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                         if const_expr(prof):
                             _atomic_add(ctl + fx.Int64(65536 + wg * 32 + 0 * 4), _memtime_lo() - _t2)
             gpu.barrier()
-            t = t + W
+            if const_expr(dyn):
+                if tid == 0:
+                    tick_v[2] = _atomic_add(ctl + fx.Int64(96 + xcd * 4), 1)
+                gpu.barrier()
+                t = arith_select(t < n_tasks, _rfl(_lds_ld_volatile(tick_base, 8)), t)
+            else:
+                t = t + W
 
         # B (own tokens): every B down landed, then a static token range per WG
         _t3 = _memtime_lo()

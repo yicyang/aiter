@@ -2274,7 +2274,7 @@ def _build_moe_gemm1(
         lds, e_idx, blk_n, tid, M, arg_p_input, p_weight, p_output, p_sorted_ids,
         p_sorted_weights, p_sorted_expert_ids, p_w_scale, p_a_scale, situ_beta_f,
         situ_beta_rcp_f, situ_linear_beta_f, situ_linear_beta_rcp_f, activation_limit_f,
-        i64_q_out, i64_q_scale, sync_before_gemm=False,
+        i64_q_out, i64_q_scale, sync_before_gemm=False, n_sub_rt=None,
     ):
         """One (expert block, N tile) of prefill_1x4 gate-up; plain helper (no AST rewrite),
         shared by the per-block kernel and the persistent mega kernel."""
@@ -2459,7 +2459,12 @@ def _build_moe_gemm1(
                 fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
                 c_out.copy(buf_atom_w128, blk_n, rd)
 
-        gemm_and_epilogue(None)
+        if const_expr(n_sub_rt is None):
+            gemm_and_epilogue(None)
+        else:
+            # n_sub_rt: valid 16-row token sub-tiles of this block (padding rows are last)
+            _scf_if_then(n_sub_rt > 2, lambda: gemm_and_epilogue(None))
+            _scf_if_then(n_sub_rt <= 2, lambda: gemm_and_epilogue(2))
 
 
     @flyc.kernel
