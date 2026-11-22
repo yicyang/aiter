@@ -108,6 +108,11 @@ def _inv_l1_l2():
     llvm.InlineAsmOp(None, [], "buffer_inv sc0 sc1\ns_waitcnt vmcnt(0)", "~{memory}", has_side_effects=True)
 
 
+def _memtime_lo():
+    v = llvm.InlineAsmOp(T.i64, [], "s_memtime $0\ns_waitcnt lgkmcnt(0)", "=s", has_side_effects=True).result
+    return fx.Int32(fx.Int64(v) & 0x7FFFFFFF)
+
+
 class _Carved:
     """Stands in for a SharedAllocator storage: .peek().view(layout) over a carved pointer."""
 
@@ -344,6 +349,8 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
     _os.environ.pop("MOE_DOWN_AS_STRIDE", None)
     gu_block, GuStorage, dn_block = gu.block, gu.storage, dn.block
     NT = N1 // gu_bn  # gate-up N tiles per block
+    TILES_PER_TASK = int(_os.environ.get("MEGA_TILES_PER_TASK", str(NT)))
+    NTT = NT // TILES_PER_TASK  # gate-up tasks per block
     LDS_PAD = 14 * 1024  # down carves ~29 KB from the start of the gate-up storage
     K = model_dim
     FP8 = fx.Float8E4M3FNUZ
@@ -377,8 +384,8 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         tail = fx.Int32(arith_min(arith_max(rem - xcd * _GROUP, 0), _GROUP))
         n_x = full_groups * _GROUP + tail
         lag_x = arith_min(fx.Int32(lag), n_x)
-        n_gd = (NT + 1) * n_x
-        n_tasks = n_gd if const_expr((dbg & 1024) == 0) else NT * n_x
+        n_gd = (NTT + 1) * n_x
+        n_tasks = n_gd
 
         xq_view = fx.make_view(fx.recast_iter(FP8, fxh._as_ptr(p_xq)), fx.make_layout((M, K), (K, 1)))
         w13_it = fx.recast_iter(FP8, fxh._as_ptr(p_w13))
@@ -439,18 +446,20 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
         t = _rfl(tick_v[0])
         W = _rfl(tick_v[1])
         n_dn = fx.Int32(0)
+        tk0 = _memtime_lo()
         iters = fx.Int32(0)
         while (t < n_tasks) & (iters < 1000000):
             iters = iters + 1
-            # tickets: G(0..lag-1, all tiles) | [D(i), G(i+lag, tiles)] ... | last downs
-            u = t - NT * lag_x
-            pair_end = (NT + 1) * (n_x - lag_x)
-            in_pairs = (t >= NT * lag_x) & (u < pair_end)
-            is_down = (t >= NT * lag_x) & ((u >= pair_end) | (u % (NT + 1) == 0))
-            loc = fx.Int32(arith_select(t < NT * lag_x, t // NT, arith_select(
-                in_pairs, arith_select(u % (NT + 1) == 0, u // (NT + 1), u // (NT + 1) + lag_x),
+            ti0 = _memtime_lo()
+            # tasks: G(0..lag-1) | [D(i), G(i+lag)] ... | last downs; a G task = all NT tiles
+            u = t - NTT * lag_x
+            pair_end = (NTT + 1) * (n_x - lag_x)
+            in_pairs = (t >= NTT * lag_x) & (u < pair_end)
+            is_down = (t >= NTT * lag_x) & ((u >= pair_end) | (u % (NTT + 1) == 0))
+            loc = fx.Int32(arith_select(t < NTT * lag_x, t // NTT, arith_select(
+                in_pairs, arith_select(u % (NTT + 1) == 0, u // (NTT + 1), u // (NTT + 1) + lag_x),
                 n_x - lag_x + (u - pair_end))))
-            tile = fx.Int32(arith_select(t < NT * lag_x, t % NT, u % (NT + 1) - 1))
+            tile = fx.Int32(arith_select(t < NTT * lag_x, t % NTT, u % (NTT + 1) - 1))
             if const_expr(dbg & 1024):
                 is_down = t < 0
                 loc = t // NT
@@ -461,7 +470,7 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                 if (tid < 64) & (dbg != 1) & (dbg != 7):
                     cur = _load_volatile(ctl + fx.Int64(64 + b * 4))
                     spins = fx.Int32(0)
-                    while (cur < NT) & (spins < _SPIN_MAX):
+                    while (cur < NTT) & (spins < _SPIN_MAX):
                         rocdl.s_sleep(1)
                         spins = spins + 1
                         cur = _load_volatile(ctl + fx.Int64(64 + b * 4))
@@ -469,33 +478,58 @@ def build_mega_prefill_v2(*, model_dim, inter_dim, topk, experts, lag=8, grid=16
                         _atomic_add(ctl + fx.Int64(40), 1)
                     _acq(dbg)
                 gpu.barrier()
+                tda = _memtime_lo()
                 _quant_block(b, tid, M, p_sorted_ids, p_hbf, i64_h, i64_hscale)
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
                 _inv(dbg)
+                tdb = _memtime_lo()
                 dn_block(b, p_h, p_w2, p_gemm2_out, p_sorted_ids,
                          p_sorted_weights, p_seid, p_s2, p_hscale, M, _carver(lds_base))
+                if const_expr(dbg & 262144):
+                    gpu.barrier()
+                    if tid == 0:
+                        wgd = fx.Int32(gpu.block_idx.x) * 4
+                        _atomic_add(ctl + fx.Int64(139264 + wgd), tda - ti0)
+                        _atomic_add(ctl + fx.Int64(143360 + wgd), tdb - tda)
+                        _atomic_add(ctl + fx.Int64(147456 + wgd), _memtime_lo() - tdb)
                 n_dn = n_dn + 1
             if (is_down == False) & (is_sum == False) & (dbg != 3) & (dbg != 7) & ((dbg != 5) | (t == 0)):  # noqa: E712
                 if const_expr((dbg & (256 | 16384)) == 0):
-                    gu_block(lds, b, tile, tid, M, xq_view, w13_it, p_hbf, p_sorted_ids,
-                             p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim,
-                             i64_h, i64_hscale, sync_before_gemm=True)
+                    t0c = _memtime_lo()
+                    for tl in range(TILES_PER_TASK):
+                        gu_block(lds, b, tile * TILES_PER_TASK + tl, tid, M, xq_view, w13_it, p_hbf,
+                                 p_sorted_ids, p_sorted_weights, p_seid, p_s13, p_xscale, sb, sbr,
+                                 slb, slbr, alim, i64_h, i64_hscale, sync_before_gemm=True)
+                        gpu.barrier()
+                    if const_expr(dbg & 262144):
+                        gpu.barrier()
+                        if tid == 0:
+                            _atomic_add(ctl + fx.Int64(65536 + fx.Int32(gpu.block_idx.x) * 8), _memtime_lo() - t0c)
+                            _atomic_add(ctl + fx.Int64(65540 + fx.Int32(gpu.block_idx.x) * 8), 1)
                 if const_expr(dbg & 64):
                     if tid == 0:
                         _atomic_add(ctl + fx.Int64(65536 + (b * NT + tile) * 8), _hw_id())
                         _atomic_add(ctl + fx.Int64(65540 + (b * NT + tile) * 8),
                                     fx.Int32(gpu.block_idx.x) + 1)
                         _atomic_add(ctl + fx.Int64(131072 + (b * NT + tile) * 4), 1)
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
-                if tid == 0:
-                    if const_expr((dbg & 512) == 0):
-                        _fence(llvm.AtomicOrdering.release)
-                    _atomic_add(ctl + fx.Int64(64 + b * 4), 1)
+                if const_expr((dbg & 131072) == 0):
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()
+                    if tid == 0:
+                        if const_expr((dbg & 512) == 0):
+                            _fence(llvm.AtomicOrdering.release)
+                        _atomic_add(ctl + fx.Int64(64 + b * 4), 1)
             gpu.barrier()
+            if const_expr(dbg & 262144):
+                if tid == 0:
+                    dti = _memtime_lo() - ti0
+                    _atomic_add(ctl + fx.Int64(arith_select(is_down, 131072, 135168) + fx.Int32(gpu.block_idx.x) * 4), dti)
             t = t + W
 
+        if const_expr(dbg & 262144):
+            if tid == 0:
+                _atomic_add(ctl + fx.Int64(98304 + fx.Int32(gpu.block_idx.x) * 4), _memtime_lo() - tk0)
         if const_expr(fuse_sum and (dbg & 2048) == 0):
             # publish this WG's downs once, then wait for every down (all XCDs) to land
             rocdl.s_waitcnt(0)
