@@ -97,8 +97,8 @@ def _build_moe_gemm2_1x4(
         BLOCK_TILE_SIZE_M == METADATA_TILE_SIZE_M
     ), "only gateup prefill_1x4 supports different kernel/metadata M tiles"
     _, generic_xcd_count = _get_down_device_config()
-    block_m_per_4wave_group = 64
-    assert BLOCK_TILE_SIZE_M == 64
+    block_m_per_4wave_group = BLOCK_TILE_SIZE_M
+    assert BLOCK_TILE_SIZE_M in (64, 128)
     assert BLOCK_TILE_SIZE_N == 256
 
     # MI308X有4个XCC，每个XCC包含4个SE，每个SE包含5个CU。
@@ -645,7 +645,7 @@ def _build_moe_gemm2_1x4(
                     aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                 )
 
-            for row_pair in range_constexpr(4):
+            for row_pair in range_constexpr(BLOCK_M // 16):
                 write_row_pair(row_pair)
                 read_store_row_pair(row_pair)
 
