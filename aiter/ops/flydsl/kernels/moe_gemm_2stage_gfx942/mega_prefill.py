@@ -1738,7 +1738,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         n_tasks = n_x if g_only else 2 * n_x  # g_only: timing probe, gate-up tasks only
         T_A = arith_select(nA_x == 0, -1, n_x + nA_x - 1)  # this queue's last A down
         if const_expr(dyn):
-            # dynamic tickets from this XCD's queue (ctl[24 + xcd])
+            # dynamic tickets from this XCD's queue (ctl[DYN_T + 4 * xcd])
             if tid == 0:
                 tick_v[2] = _atomic_add(ctl + fx.Int64(DYN_T + xcd * 4), 1)
             gpu.barrier()

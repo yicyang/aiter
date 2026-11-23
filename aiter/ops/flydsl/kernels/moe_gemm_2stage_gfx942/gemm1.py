@@ -71,6 +71,8 @@ def _build_moe_gemm1(
     # fused quant epilogue: fp8 h row stride (bytes) and per-route scale stride (floats)
     Q_STRIDE = int(os.environ.get("MOE_GATEUP_Q_STRIDE", "0")) or N // 2
     QS_STRIDE = int(os.environ.get("MOE_GATEUP_QS_STRIDE", "1"))
+    # prefill_1x4 hot loop: MFMAs between consecutive buffer_loads (4 = original schedule)
+    VMEM_GAP = int(os.environ.get("MOE_GATEUP_VMEM_GAP", "4"))
     SKIP_PAD_ONE = os.environ.get("MOE_GATEUP_SKIP_PAD_ONE", "0") == "1"
     if FUSE_QUANT:
         assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
@@ -1725,7 +1727,40 @@ def _build_moe_gemm1(
         # full A(tile) LDS read (ds_read), done once per stage (cross-stage rotation)
         lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
+        def hot_loop_scheduler_gap(gap):
+            # Spread the stage's buffer_loads over the whole MFMA stream: one vmem every `gap`
+            # MFMAs (ds_reads up front / between, as many as the stage has), ds_writes last
+            # with one MFMA each. Counts follow the real per-stage instruction counts.
+            mfma_cnt = 2 * mfma_per_gemm
+            n_vmem = mem_a_cnt + 2 * mem_b_cnt
+            n_dswr = mem_a_cnt
+            dsrd_left = lds_a_cnt
+            used = 0
+            first = min(2, dsrd_left)
+            rocdl.sched_dsrd(first)
+            dsrd_left -= first
+            for _ in range_constexpr(n_vmem):
+                rocdl.sched_vmem(1)
+                rocdl.sched_mfma(gap // 2)
+                if const_expr(dsrd_left > 0):
+                    rocdl.sched_dsrd(1)
+                    dsrd_left -= 1
+                rocdl.sched_mfma(gap - gap // 2)
+                used += gap
+            if const_expr(dsrd_left > 0):
+                rocdl.sched_dsrd(dsrd_left)
+            if const_expr(mfma_cnt - n_dswr - used > 0):
+                rocdl.sched_mfma(mfma_cnt - n_dswr - used)
+                used = mfma_cnt - n_dswr
+            for _ in range_constexpr(n_dswr):
+                rocdl.sched_dswr(1)
+                if const_expr(used < mfma_cnt):
+                    rocdl.sched_mfma(1)
+                    used += 1
+
         def hot_loop_scheduler():
+            if const_expr(VMEM_GAP != 4):
+                return hot_loop_scheduler_gap(VMEM_GAP)
             # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
             # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
             mfma_cnt = 2 * mfma_per_gemm
