@@ -415,6 +415,37 @@ def build_gu_role_sum_probe(*, model_dim, inter_dim, topk, experts, mode="rolesu
                         b = b + grid
                 finally:
                     _gpum.barrier = _real
+            elif const_expr(mode == "rolepipe"):
+                # one 4-token chunk per gate-up tile, software-pipelined across the tile's
+                # barriers: slice j's loads issued after barrier j, summed after barrier j + LAG
+                LAG = 3
+                NS = H // 8 // 64
+                L0 = 2  # stages between the row-index loads and the first slice's loads
+                assert nbar[0] >= L0 + NS + LAG, nbar[0]
+                hl = (tid - 256) % 64
+                hw = (tid - 256) // 64
+                ch = ch0
+                b2 = wg
+                while b2 < nblk:
+                    for tl2 in range(NT):
+                        tok = arith_select(ch < ch1, ch * 4 + hw, M)
+                        pend = {}
+                        locs = None
+                        for j in range_constexpr(nbar[0]):
+                            if const_expr(j == 0):
+                                locs = _sum_locs(tok, M, p_loc, topk)
+                            if const_expr(L0 <= j < L0 + NS):
+                                pend[j - L0] = _sum_issue(locs, hl, p_g2, H, topk, j - L0)
+                            if const_expr(L0 + LAG <= j < L0 + NS + LAG):
+                                fr, va = pend.pop(j - L0 - LAG)
+                                _sum_consume(fr, va, tok, hl, M, p_out, H, topk, j - L0 - LAG)
+                            # keep each stage's helper code between its own barriers (the
+                            # scheduler otherwise hoists slice loads next to their index loads)
+                            rocdl.sched_barrier(0)
+                            gpu.barrier()
+                            rocdl.sched_barrier(0)
+                        ch = ch + 1
+                    b2 = b2 + grid
             else:
                 ch = ch0
                 b2 = wg
@@ -442,3 +473,45 @@ def build_gu_role_sum_probe(*, model_dim, inter_dim, topk, experts, mode="rolesu
                           ).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch
+
+
+
+def _sum_locs(tok, M, p_loc, topk):
+    """Pipelined top-k sum, part 0: the token's topk row indices (issued one stage early).
+    Tokens >= M (idle stages) get -1 everywhere, so their slice loads all hit row 0 (L2)."""
+    tok_c = arith_min(tok, M - 1)
+    return [arith_select(tok < M, p_loc[tok_c * topk + k], -1) for k in range(topk)]
+
+
+def _sum_issue(locs, lane, p_g2, H, topk, i):
+    """Pipelined top-k sum, part 1: load slice i (8 columns per lane) of the topk rows
+    (one wave per token). Returns (fragments, valid flags)."""
+    valid = [loc >= 0 for loc in locs]
+    g2 = fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_g2))
+    copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
+    col = (lane + 64 * i) * 8
+    frags = []
+    for k in range(topk):
+        row = g2 + fx.Int64(valid[k].select(locs[k], 0)) * H
+        atom = fx.make_view(row + col, fx.make_layout(8, 1))
+        frag = fx.make_fragment_like(atom)
+        fx.copy(copy_atom, atom, frag)
+        frags.append(frag)
+    return frags, valid
+
+
+def _sum_consume(frags, valid, tok, lane, M, p_out, H, topk, i):
+    """Pipelined top-k sum, part 2: add the topk fragments in slot order and store slice i."""
+    copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy(128), fx.BFloat16)
+    out_row = fx.make_view(fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_out)) + fx.Int64(tok) * H,
+                           fx.make_layout(H, 1))
+    out_buf = fx.rocdl.make_buffer_tensor(
+        out_row, max_size=False, num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
+    col = (lane + 64 * i) * 8
+    acc = valid[0].select(frags[0].load().to(fx.Float32), 0.0)
+    for k in range(1, topk):
+        acc += valid[k].select(frags[k].load().to(fx.Float32), 0.0)
+    dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
+    of = fx.make_fragment_like(dst)
+    of.store(acc.to(fx.BFloat16))
+    fx.copy(copy_atom_b, of, dst)
