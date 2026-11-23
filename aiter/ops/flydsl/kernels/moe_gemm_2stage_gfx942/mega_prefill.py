@@ -1178,7 +1178,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False, fast_prefix=False):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False, fast_prefix=False, late_gb=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1787,7 +1787,12 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             remA = nbA - fgA * (_XCD * XG)
             nA_x = fgA * XG + fx.Int32(arith_min(arith_max(remA - xcd * XG, 0), XG))
         n_tasks = n_x if g_only else 2 * n_x  # g_only: timing probe, gate-up tasks only
-        T_A = arith_select(nA_x == 0, -1, n_x + nA_x - 1)  # this queue's last A down
+        if const_expr(late_gb):
+            # task order per XCD: [gate-up A][down A] (SA + push) [gate-up B][down B], so the
+            # B gate-ups also overlap the peer push
+            T_A = arith_select(nA_x == 0, -1, 2 * nA_x - 1)
+        else:
+            T_A = arith_select(nA_x == 0, -1, n_x + nA_x - 1)  # this queue's last A down
         if const_expr(dyn):
             # dynamic tickets from this XCD's queue (ctl[DYN_T + 4 * xcd])
             if tid == 0:
@@ -1857,8 +1862,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                 sa_done = sa_done + 1
             _t2 = _memtime_lo()
             if t < n_tasks:
-                is_down = t >= n_x
-                loc = arith_select(is_down, t - n_x, t)
+                if const_expr(late_gb):
+                    is_down = ((t >= nA_x) & (t < 2 * nA_x)) | (t >= nA_x + n_x)
+                    loc = arith_select(t < nA_x, t, arith_select(t < 2 * nA_x, t - nA_x,
+                                       arith_select(t < nA_x + n_x, t - nA_x, t - n_x)))
+                else:
+                    is_down = t >= n_x
+                    loc = arith_select(is_down, t - n_x, t)
                 if const_expr(xcd_split):
                     b = arith_select(loc < nA_x, xa0 + loc, xb0 + loc - nA_x)
                 else:
