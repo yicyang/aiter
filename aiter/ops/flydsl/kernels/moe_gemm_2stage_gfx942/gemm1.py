@@ -1556,6 +1556,7 @@ def _build_moe_gemm1(
         arg_p_weight: fx.Tensor,  # preshuffle layout with gate/up grouping composed
         lds,  # SharedStorage with sorted_lds, a_ping, a_pong
         n_active=None,  # token sub-tiles (16 rows) to compute; the rest stay 0
+        tid_in=None,  # thread index within the 256-thread group (default: thread_idx.x)
     ):
         """1x4 tiled GEMM: the 4 waves tile N(channel); the full TILE_M is shared across
         all waves (no M-split). Each wave owns contiguous_n//4 output channels of BOTH the
@@ -1566,7 +1567,7 @@ def _build_moe_gemm1(
         MFMA M-side) so each C fragment's value dim runs along channel (4 contiguous
         channels/lane), letting the epilogue store 64-bit instead of the A-first 16-bit.
         Convention inside this function: m = channel (mma_M), n = token (mma_N)."""
-        tid = gpu.thread_idx.x
+        tid = gpu.thread_idx.x if tid_in is None else tid_in
         contiguous_n = TILE_N // 2
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
@@ -2274,7 +2275,7 @@ def _build_moe_gemm1(
         lds, e_idx, blk_n, tid, M, arg_p_input, p_weight, p_output, p_sorted_ids,
         p_sorted_weights, p_sorted_expert_ids, p_w_scale, p_a_scale, situ_beta_f,
         situ_beta_rcp_f, situ_linear_beta_f, situ_linear_beta_rcp_f, activation_limit_f,
-        i64_q_out, i64_q_scale, sync_before_gemm=False, n_sub_rt=None,
+        i64_q_out, i64_q_scale, sync_before_gemm=False, n_sub_rt=None, group_tid=False,
     ):
         """One (expert block, N tile) of prefill_1x4 gate-up; plain helper (no AST rewrite),
         shared by the per-block kernel and the persistent mega kernel."""
@@ -2378,6 +2379,7 @@ def _build_moe_gemm1(
                 arg_p_weight,
                 lds,
                 n_active=n_active,
+                tid_in=tid if group_tid else None,
             )
 
             if const_expr(weight_dtype != fx.BFloat16):
