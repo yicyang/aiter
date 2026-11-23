@@ -515,3 +515,93 @@ def _sum_consume(frags, valid, tok, lane, M, p_out, H, topk, i):
     of = fx.make_fragment_like(dst)
     of.store(acc.to(fx.BFloat16))
     fx.copy(copy_atom_b, of, dst)
+
+
+
+def build_sum_probe(*, hidden, topk, fp8=False, grid=160):
+    """Top-k sum of g2 rows over all M tokens (one wave per token, the mega kernel's SA math);
+    fp8=True writes sglang fp8 RS records (as the megamoe fp8 push) instead of bf16 rows."""
+    import flydsl.expr.math  # noqa: F401
+    from flydsl._mlir.dialects import llvm, vector
+    from flydsl.expr.typing import T
+    from flydsl.expr.utils.arith import _to_raw as _raw
+
+    from .. import buffer_ops
+
+    H = hidden
+    REC = H + H // 32 * 2
+
+    def records(acc, lane, tok, M, col, rec_rsrc):
+        f32 = T.f32
+        vb = acc.to(fx.BFloat16)
+        f8 = [vb[j].to(fx.Float32) for j in range(8)]
+        amax = fx.Float32(0.0)
+        for j in range(8):
+            amax = amax.maximumf(fx.Float32(llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(f8[j])], [], [])))
+        for dist in (1, 2):
+            amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(64)))
+        scale_b = (amax / fx.Float32(240.0)).to(fx.BFloat16)
+        scale = scale_b.to(fx.Float32)
+        inv = (scale > fx.Float32(0.0)).select(fx.Float32(1.0) / scale, fx.Float32(0.0))
+        q = [fx.math.clampf(f8[j] * inv, fx.Float32(-240.0), fx.Float32(240.0)) for j in range(8)]
+        words = []
+        for wd in range(2):
+            lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd]), _raw(q[4 * wd + 1]), fx.Int32(0), False)
+            words.append(rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd + 2]), _raw(q[4 * wd + 3]), lo, True))
+        row = arith_min(tok, M - 1) * REC
+        buffer_ops.buffer_store(vector.from_elements(T.vec(2, T.i32), words), rec_rsrc, row + col,
+                                mask=_raw(tok < M), cache_modifier=17, offset_is_bytes=True)
+        buffer_ops.buffer_store(_raw(scale_b), rec_rsrc, row + H + col // 32 * 2,
+                                mask=_raw((tok < M) & (lane % 4 == 0)), cache_modifier=17,
+                                offset_is_bytes=True)
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def sum_probe(p_loc: fx.Pointer, p_g2: fx.Pointer, p_out: fx.Pointer, p_rec: fx.Pointer, M: fx.Int32):
+        tid = fx.Int32(gpu.thread_idx.x)
+        wg = fx.Int32(gpu.block_idx.x)
+        lane = tid % 64
+        n_ch = (M + 3) // 4
+        ch = wg * n_ch // grid
+        ch1 = (wg + 1) * n_ch // grid
+        rec_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(fx.ptrtoint(p_rec)), num_records_bytes=fx.Int64(M) * fx.Int64(REC))
+        while ch < ch1:
+            tok = ch * 4 + tid // 64
+            tok_c = arith_min(tok, M - 1)
+            locs = [p_loc[tok_c * topk + k] for k in range(topk)]
+            valid = [loc >= 0 for loc in locs]
+            g2 = fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_g2))
+            rows = [g2 + fx.Int64(valid[k].select(locs[k], 0)) * H for k in range(topk)]
+            copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
+            copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy(128, cache_modifier=17), fx.BFloat16)
+            out_row = fx.make_view(fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_out)) + fx.Int64(tok) * H,
+                                   fx.make_layout(H, 1))
+            out_buf = fx.rocdl.make_buffer_tensor(
+                out_row, max_size=False, num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
+            for i in range(H // 8 // 64):
+                col = (lane + 64 * i) * 8
+                frags_i = []
+                for k in range(topk):
+                    atom = fx.make_view(rows[k] + col, fx.make_layout(8, 1))
+                    frag = fx.make_fragment_like(atom)
+                    fx.copy(copy_atom, atom, frag)
+                    frags_i.append(frag)
+                acc = valid[0].select(frags_i[0].load().to(fx.Float32), 0.0)
+                for k in range(1, topk):
+                    acc += valid[k].select(frags_i[k].load().to(fx.Float32), 0.0)
+                if const_expr(fp8):
+                    records(acc, lane, tok, M, col, rec_rsrc)
+                else:
+                    dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
+                    of = fx.make_fragment_like(dst)
+                    of.store(acc.to(fx.BFloat16))
+                    fx.copy(copy_atom_b, of, dst)
+            ch = ch + 1
+
+    @flyc.jit
+    def launch(p_loc: fx.Pointer, p_g2: fx.Pointer, p_out: fx.Pointer, p_rec: fx.Pointer,
+               M: fx.Int32, stream: fx.Stream):
+        sum_probe(p_loc, p_g2, p_out, p_rec, M, value_attrs={"rocdl.waves_per_eu": 2}).launch(
+            grid=(grid, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch

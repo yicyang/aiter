@@ -1178,7 +1178,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False, fast_prefix=False, late_gb=False):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False, fast_prefix=False, late_gb=False, push_fp8=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1348,7 +1348,35 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
     SORT_XR = 106528  # xcd_split: [first A block of XCD x] x4, [first B block of XCD x] x4
     DYN_T = 106560  # dyn: per-XCD task tickets (was 96 + 4x, which aliased gate-up done of blocks 8-11)
 
-    def _sum_tokens(chunk, tid, M, p_loc, p_g2, p_out, wt):
+    REC = H + H // 32 * 2  # fp8 RS record: H e4m3fnuz values, then one bf16 scale per 32
+
+    def _fp8_records(acc, lane, tok, M, col, rec_rsrc):
+        """sglang _quantize_rows on this lane's 8 bf16-rounded sums: per 32-column group (4
+        lanes) scale = bf16(amax / 240), q = clamp(x * (1 / scale), +-240) -> e4m3fnuz."""
+        f32 = T.f32
+        vb = acc.to(fx.BFloat16)
+        f8 = [vb[j].to(fx.Float32) for j in range(8)]
+        amax = fx.Float32(0.0)
+        for j in range(8):
+            amax = amax.maximumf(fx.Float32(llvm.call_intrinsic(f32, "llvm.fabs.f32", [_raw(f8[j])], [], [])))
+        for dist in (1, 2):
+            amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(64)))
+        scale_b = (amax / fx.Float32(240.0)).to(fx.BFloat16)
+        scale = scale_b.to(fx.Float32)
+        inv = (scale > fx.Float32(0.0)).select(fx.Float32(1.0) / scale, fx.Float32(0.0))
+        q = [fx.math.clampf(f8[j] * inv, fx.Float32(-240.0), fx.Float32(240.0)) for j in range(8)]
+        words = []
+        for wd in range(2):
+            lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd]), _raw(q[4 * wd + 1]), fx.Int32(0), False)
+            words.append(rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[4 * wd + 2]), _raw(q[4 * wd + 3]), lo, True))
+        row = arith_min(tok, M - 1) * REC
+        buffer_ops.buffer_store(vector.from_elements(T.vec(2, T.i32), words), rec_rsrc, row + col,
+                                mask=_raw(tok < M), cache_modifier=17, offset_is_bytes=True)
+        buffer_ops.buffer_store(_raw(scale_b), rec_rsrc, row + H + col // 32 * 2,
+                                mask=_raw((tok < M) & (lane % 4 == 0)), cache_modifier=17,
+                                offset_is_bytes=True)
+
+    def _sum_tokens(chunk, tid, M, p_loc, p_g2, p_out, wt, rec_i64=None):
         # moe_reduce.sorted_sum's math and order; one wave per token, 4 tokens per call.
         lane = tid % 64
         tok = chunk * 4 + tid // 64
@@ -1365,6 +1393,9 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         out_buf = fx.rocdl.make_buffer_tensor(
             out_row, max_size=False,
             num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
+        if const_expr(rec_i64 is not None):
+            rec_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                rec_i64, num_records_bytes=fx.Int64(M) * fx.Int64(REC))
         for i in range(H // 8 // 64):
             if const_expr(wg3 and i > 0):
                 # keep each slice's 11 row loads (44 VGPRs) from being hoisted together, so the
@@ -1380,10 +1411,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             acc = valid[0].select(frags_i[0].load().to(fx.Float32), 0.0)
             for k in range(1, topk):
                 acc += valid[k].select(frags_i[k].load().to(fx.Float32), 0.0)
-            dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
-            of = fx.make_fragment_like(dst)
-            of.store(acc.to(fx.BFloat16))
-            fx.copy(copy_atom_b, of, dst)
+            if const_expr(rec_i64 is not None):
+                _fp8_records(acc, lane, tok, M, col, rec_rsrc)
+            else:
+                dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
+                of = fx.make_fragment_like(dst)
+                of.store(acc.to(fx.BFloat16))
+                fx.copy(copy_atom_b, of, dst)
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def mega_moe_prefill_v3(
@@ -1842,7 +1876,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                 ca = wg * chA // grid
                 ca_end = (wg + 1) * chA // grid
                 while ca < ca_end:
-                    _sum_tokens(ca, tid, MA, par_ptr(0, T.i32), p_g2, par_ptr(1, T.bf16, 16), push)
+                    if const_expr(push_fp8):
+                        # peer rows go out as fp8 records written straight into the push source
+                        rec_src = (fx.Int64(p_par[11]) << 32) | (fx.Int64(p_par[10]) & 0xFFFFFFFF)
+                        _sum_tokens(ca, tid, MA, par_ptr(0, T.i32), p_g2, par_ptr(1, T.bf16, 16), push,
+                                    rec_i64=rec_src)
+                    else:
+                        _sum_tokens(ca, tid, MA, par_ptr(0, T.i32), p_g2, par_ptr(1, T.bf16, 16), push)
                     ca = ca + 1
                 if const_expr(push):
                     rocdl.s_waitcnt(0)
@@ -1854,7 +1894,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                             dst = (fx.Int64(p_par[9]) << 32) | (fx.Int64(p_par[8]) & 0xFFFFFFFF)
                             src = (fx.Int64(p_par[11]) << 32) | (fx.Int64(p_par[10]) & 0xFFFFFFFF)
                             sdma = cco.DevComm(dev_comm).sdma()
-                            sdma.put_ptr(p_par[3], dst, src, fx.Int64(MA) * fx.Int64(H * 2),
+                            sdma.put_ptr(p_par[3], dst, src, fx.Int64(MA) * fx.Int64(REC if push_fp8 else H * 2),
                                          p_par[4], remote_signal=True)
                 if const_expr(prof):
                     if tid == 0:
