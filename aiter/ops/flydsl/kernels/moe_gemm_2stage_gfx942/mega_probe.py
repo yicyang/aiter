@@ -14,12 +14,12 @@ import types
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl.expr import gpu, rocdl, const_expr
+from flydsl.expr import gpu, rocdl, const_expr, range_constexpr
 from flydsl.expr.primitive import PointerType
 from . import common as fxh
 
 from .gemm1 import compile_moe_gemm1
-from .mega_prefill import _rfl, arith_select
+from .mega_prefill import _rfl, arith_select, arith_min
 
 
 class _LdsPtr:
@@ -222,7 +222,7 @@ def _group_barrier(lb, off, n_waves=4):
         _gpum.barrier = saved
 
 
-def build_gu_role_probe(*, model_dim, inter_dim, topk, experts):
+def build_gu_role_probe(*, model_dim, inter_dim, topk, experts, hw_mirror=False):
     """8 waves, 1 WG per CU: waves 0-3 run gate-up (BN128) with a software barrier among
     themselves; waves 4-7 are idle helpers (exit at once). Measures the software barrier's cost."""
     import os as _os
@@ -260,7 +260,38 @@ def build_gu_role_probe(*, model_dim, inter_dim, topk, experts):
         if tid < 4:
             _lds_st(lb, tid * 4, 0)
         gpu.barrier()  # all 8 waves, before the roles split
-        if tid < 256:
+        if const_expr(hw_mirror):
+            # compute waves keep the hardware barrier; helper waves execute exactly the same
+            # number of s_barriers per task (counted while tracing the compute body)
+            import flydsl.expr.gpu as _gpum
+            nbar = [0]
+            _real = _gpum.barrier
+
+            def _counting(*a, **k):
+                nbar[0] += 1
+                return _real(*a, **k)
+            if tid < 256:
+                _gpum.barrier = _counting
+                try:
+                    b = wg
+                    while b < nblk:
+                        for tl in range(NT):
+                            gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw,
+                                     p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim, zero64,
+                                     zero64, sync_before_gemm=True)
+                            gpu.barrier()
+                        b = b + grid
+                finally:
+                    _gpum.barrier = _real
+            else:
+                b2 = wg
+                while b2 < nblk:
+                    for tl2 in range(NT):
+                        for _q in range_constexpr(nbar[0]):
+                            gpu.barrier()
+                    b2 = b2 + grid
+        else:
+          if tid < 256:
             with _group_barrier(lb, 0, 4):
                 b = wg
                 while b < nblk:
@@ -279,5 +310,135 @@ def build_gu_role_probe(*, model_dim, inter_dim, topk, experts):
         gu_role_probe(p_xq, p_w13, p_sid, p_sw, p_seid, p_nv, p_s13, p_xscale, M, sb, sbr, slb,
                       slbr, alim, p_hbf, value_attrs={"rocdl.waves_per_eu": 2},
                       ).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
+
+    return launch
+
+
+def _sum_tokens_g(chunk, tid, M, p_loc, p_g2, p_out, wt, H, topk):
+    # moe_reduce.sorted_sum's math and order; one wave per token, 4 tokens per call.
+    lane = tid % 64
+    tok = chunk * 4 + tid // 64
+    tok_c = arith_min(tok, M - 1)
+    locs = [p_loc[tok_c * topk + k] for k in range(topk)]
+    valid = [loc >= 0 for loc in locs]
+    g2 = fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_g2))
+    rows = [g2 + fx.Int64(valid[k].select(locs[k], 0)) * H for k in range(topk)]
+    copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
+    copy_atom_b = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(128, cache_modifier=17) if wt else fx.rocdl.BufferCopy(128), fx.BFloat16)
+    out_row = fx.make_view(fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_out)) + fx.Int64(tok) * H,
+                           fx.make_layout(H, 1))
+    out_buf = fx.rocdl.make_buffer_tensor(
+        out_row, max_size=False,
+        num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
+    for i in range(H // 8 // 64):
+        if const_expr(False and i > 0):
+            # keep each slice's 11 row loads (44 VGPRs) from being hoisted together, so the
+            # sum phase stays inside the 168-VGPR budget of 3 WGs per CU
+            rocdl.sched_barrier(0)
+        col = (lane + 64 * i) * 8
+        frags_i = []
+        for k in range(topk):
+            atom = fx.make_view(rows[k] + col, fx.make_layout(8, 1))
+            frag = fx.make_fragment_like(atom)
+            fx.copy(copy_atom, atom, frag)
+            frags_i.append(frag)
+        acc = valid[0].select(frags_i[0].load().to(fx.Float32), 0.0)
+        for k in range(1, topk):
+            acc += valid[k].select(frags_i[k].load().to(fx.Float32), 0.0)
+        dst = fx.make_view(fx.get_iter(out_buf) + col, fx.make_layout(8, 1))
+        of = fx.make_fragment_like(dst)
+        of.store(acc.to(fx.BFloat16))
+        fx.copy(copy_atom_b, of, dst)
+
+
+def build_gu_role_sum_probe(*, model_dim, inter_dim, topk, experts, mode="rolesum"):
+    """8 waves, 1 WG per CU. Waves 0-3: gate-up (hardware barrier). Waves 4-7: top-k sums of
+    an independent g2 (one 4-token chunk at the start of each gate-up tile), executing the
+    same number of s_barriers as the compute waves. mode="sumonly": the sums alone."""
+    N1 = 2 * inter_dim
+    NT = N1 // 128
+    K = model_dim
+    H = model_dim
+    gu = compile_moe_gemm1(
+        N=N1, K=model_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, tile_k=128, alg="prefill_1x4", E=experts,
+        act_quant_type="ptpc", activation="silu", METADATA_TILE_SIZE_M=64, FUSE_QUANT=False,
+        XCD_GROUP=0,
+    )
+    gu_block, GuStorage = gu.block, gu.storage
+    FP8 = fx.Float8E4M3FNUZ
+    grid = 80
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def gu_role_sum_probe(
+        p_xq: fx.Pointer, p_w13: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
+        p_seid: fx.Pointer, p_nv: fx.Pointer, p_s13: fx.Pointer, p_xscale: fx.Pointer,
+        M: fx.Int32, sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
+        alim: fx.Float32, p_hbf: fx.Pointer, p_loc: fx.Pointer, p_g2: fx.Pointer,
+        p_out: fx.Pointer,
+    ):
+        import flydsl.expr.gpu as _gpum
+        tid = fx.Int32(gpu.thread_idx.x)
+        wg = fx.Int32(gpu.block_idx.x)
+        nblk = _rfl(fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0] // 64)
+        xq_view = fx.make_view(fx.recast_iter(FP8, fxh._as_ptr(p_xq)), fx.make_layout((M, K), (K, 1)))
+        w13_it = fx.recast_iter(FP8, fxh._as_ptr(p_w13))
+        zero64 = fx.Int64(0)
+        lds = fx.SharedAllocator().allocate(GuStorage)
+        n_ch = (M + 3) // 4
+        ch0 = wg * n_ch // grid
+        ch1 = (wg + 1) * n_ch // grid
+        if const_expr(mode == "sumonly"):
+            if tid >= 256:
+                ch = ch0
+                while ch < ch1:
+                    _sum_tokens_g(ch, tid - 256, M, p_loc, p_g2, p_out, False, H, topk)
+                    ch = ch + 1
+        else:
+            nbar = [0]
+            _real = _gpum.barrier
+
+            def _counting(*a, **k):
+                nbar[0] += 1
+                return _real(*a, **k)
+            if tid < 256:
+                _gpum.barrier = _counting
+                try:
+                    b = wg
+                    while b < nblk:
+                        for tl in range(NT):
+                            gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw,
+                                     p_seid, p_s13, p_xscale, sb, sbr, slb, slbr, alim, zero64,
+                                     zero64, sync_before_gemm=True)
+                            gpu.barrier()
+                        b = b + grid
+                finally:
+                    _gpum.barrier = _real
+            else:
+                ch = ch0
+                b2 = wg
+                while b2 < nblk:
+                    for tl2 in range(NT):
+                        if ch < ch1:
+                            _sum_tokens_g(ch, tid - 256, M, p_loc, p_g2, p_out, False, H, topk)
+                        ch = ch + 1
+                        for _q in range_constexpr(nbar[0]):
+                            gpu.barrier()
+                    b2 = b2 + grid
+                while ch < ch1:  # compute waves are done: no more barriers
+                    _sum_tokens_g(ch, tid - 256, M, p_loc, p_g2, p_out, False, H, topk)
+                    ch = ch + 1
+
+    @flyc.jit
+    def launch(p_xq: fx.Pointer, p_w13: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
+               p_seid: fx.Pointer, p_nv: fx.Pointer, p_s13: fx.Pointer, p_xscale: fx.Pointer,
+               M: fx.Int32, sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
+               alim: fx.Float32, p_hbf: fx.Pointer, p_loc: fx.Pointer, p_g2: fx.Pointer,
+               p_out: fx.Pointer, stream: fx.Stream):
+        gu_role_sum_probe(p_xq, p_w13, p_sid, p_sw, p_seid, p_nv, p_s13, p_xscale, M, sb, sbr,
+                          slb, slbr, alim, p_hbf, p_loc, p_g2, p_out,
+                          value_attrs={"rocdl.waves_per_eu": 2},
+                          ).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch
