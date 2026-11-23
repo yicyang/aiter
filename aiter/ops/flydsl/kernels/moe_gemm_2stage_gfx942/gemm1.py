@@ -68,6 +68,9 @@ def _build_moe_gemm1(
     SKIP_PAD = alg == "prefill_1x4" and os.environ.get("MOE_GATEUP_SKIP_PAD", "0") == "1"
     # A persistent kernel that reuses this storage for other tasks can ask for more LDS.
     MIN_LDS_BYTES = int(os.environ.get("MOE_GATEUP_MIN_LDS", "0"))
+    # fused quant epilogue: fp8 h row stride (bytes) and per-route scale stride (floats)
+    Q_STRIDE = int(os.environ.get("MOE_GATEUP_Q_STRIDE", "0")) or N // 2
+    QS_STRIDE = int(os.environ.get("MOE_GATEUP_QS_STRIDE", "1"))
     SKIP_PAD_ONE = os.environ.get("MOE_GATEUP_SKIP_PAD_ONE", "0") == "1"
     if FUSE_QUANT:
         assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
@@ -2203,10 +2206,10 @@ def _build_moe_gemm1(
         fx.copy(rd_atom, src, frag)
 
         q_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            i64_q_out, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * inter)
+            i64_q_out, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * Q_STRIDE)
         )
         s_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            i64_q_scale, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * 4)
+            i64_q_scale, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * 4 * QS_STRIDE)
         )
         quarter = tid % 4
         row_in_pass = tid // 4
@@ -2243,7 +2246,7 @@ def _build_moe_gemm1(
             buffer_ops.buffer_store(
                 _raw(scale),
                 s_rsrc,
-                route * fx.Int32(4),
+                route * fx.Int32(4 * QS_STRIDE),
                 mask=_raw(quarter == fx.Int32(0)),
                 offset_is_bytes=True,
             )
@@ -2267,7 +2270,7 @@ def _build_moe_gemm1(
                     )
                 packed = vector.from_elements(T.vec(2, T.i32), words)
                 off = (
-                    route * fx.Int32(inter) + fx.Int32(sl * 32) + quarter * fx.Int32(8)
+                    route * fx.Int32(Q_STRIDE) + fx.Int32(sl * 32) + quarter * fx.Int32(8)
                 )
                 buffer_ops.buffer_store(packed, q_rsrc, off, offset_is_bytes=True)
 
