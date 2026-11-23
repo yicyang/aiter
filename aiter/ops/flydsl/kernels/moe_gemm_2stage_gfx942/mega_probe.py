@@ -8,6 +8,7 @@ sort, in one of three shapes:
          different blocks in lockstep (gate-up barriers are workgroup-wide), each group with
          its own 16 KB LDS region
 """
+import contextlib
 import types
 
 import flydsl.compiler as flyc
@@ -176,4 +177,107 @@ def build_dn_probe(*, model_dim, inter_dim, topk, experts, nwg=2):
                  ).launch(grid=(grid, 1, 1), block=(256, 1, 1), stream=stream)
 
     launch.compile_hints["target_features"] = "-packed-fp32-ops"
+    return launch
+
+
+# ---- software barrier for a 4-wave compute group (role-split WGs) ----
+_LGKM0 = 15 | (7 << 4) | (0 << 8) | (3 << 14)  # s_waitcnt vmcnt(63) expcnt(7) lgkmcnt(0)
+
+
+def _lds_helpers():
+    from .mega_prefill import _lds_add, _lds_ld_volatile, _lds_st
+    return _lds_add, _lds_ld_volatile, _lds_st
+
+
+@flyc.jit
+def _sw_group_barrier(lb, off, n_waves):
+    """Barrier over n_waves waves through one monotonically increasing LDS counter [off]:
+    one LDS atomic per wave (lane 0), then spin until the counter reaches the end of this
+    round. Same memory semantics as gpu.barrier here (lgkmcnt(0) first)."""
+    _lds_add, _lds_ld_volatile, _lds_st = _lds_helpers()
+    rocdl.s_waitcnt(_LGKM0)
+    lane = fx.Int32(gpu.thread_idx.x) % 64
+    old_v = fx.Int32(0)
+    if lane == 0:
+        old_v = _lds_add(lb, off, 1)
+    old = _rfl(old_v)
+    target = (old // n_waves + 1) * n_waves
+    cur = old + 1
+    it = fx.Int32(0)
+    while (cur < target) & (it < 16777216):
+        cur = _rfl(_lds_ld_volatile(lb, off))
+        it = it + 1
+    rocdl.s_waitcnt(_LGKM0)
+
+
+@contextlib.contextmanager
+def _group_barrier(lb, off, n_waves=4):
+    """While tracing a compute body, route gpu.barrier() to the software group barrier."""
+    import flydsl.expr.gpu as _gpum
+    saved = _gpum.barrier
+    _gpum.barrier = lambda *a, **k: _sw_group_barrier(lb, off, n_waves)
+    try:
+        yield
+    finally:
+        _gpum.barrier = saved
+
+
+def build_gu_role_probe(*, model_dim, inter_dim, topk, experts):
+    """8 waves, 1 WG per CU: waves 0-3 run gate-up (BN128) with a software barrier among
+    themselves; waves 4-7 are idle helpers (exit at once). Measures the software barrier's cost."""
+    import os as _os
+    N1 = 2 * inter_dim
+    NT = N1 // 128
+    K = model_dim
+    gu = compile_moe_gemm1(
+        N=N1, K=model_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, tile_k=128, alg="prefill_1x4", E=experts,
+        act_quant_type="ptpc", activation="silu", METADATA_TILE_SIZE_M=64, FUSE_QUANT=False,
+        XCD_GROUP=0,
+    )
+    gu_block, GuStorage = gu.block, gu.storage
+    FP8 = fx.Float8E4M3FNUZ
+    grid = 80
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def gu_role_probe(
+        p_xq: fx.Pointer, p_w13: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
+        p_seid: fx.Pointer, p_nv: fx.Pointer, p_s13: fx.Pointer, p_xscale: fx.Pointer,
+        M: fx.Int32, sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
+        alim: fx.Float32, p_hbf: fx.Pointer,
+    ):
+        _lds_add, _lds_ld_volatile, _lds_st = _lds_helpers()
+        tid = fx.Int32(gpu.thread_idx.x)
+        wg = fx.Int32(gpu.block_idx.x)
+        nblk = _rfl(fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0] // 64)
+        xq_view = fx.make_view(fx.recast_iter(FP8, fxh._as_ptr(p_xq)), fx.make_layout((M, K), (K, 1)))
+        w13_it = fx.recast_iter(FP8, fxh._as_ptr(p_w13))
+        zero64 = fx.Int64(0)
+        sa = fx.SharedAllocator()
+        bw = sa.allocate(fx.Array[fx.Int32, 4, 16]).peek()
+        lds = sa.allocate(GuStorage)
+        lb = fx.Int64(fx.ptrtoint(bw.ptr))
+        if tid < 4:
+            _lds_st(lb, tid * 4, 0)
+        gpu.barrier()  # all 8 waves, before the roles split
+        if tid < 256:
+            with _group_barrier(lb, 0, 4):
+                b = wg
+                while b < nblk:
+                    for tl in range(NT):
+                        gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw, p_seid,
+                                 p_s13, p_xscale, sb, sbr, slb, slbr, alim, zero64, zero64,
+                                 sync_before_gemm=True)
+                        gpu.barrier()
+                    b = b + grid
+
+    @flyc.jit
+    def launch(p_xq: fx.Pointer, p_w13: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
+               p_seid: fx.Pointer, p_nv: fx.Pointer, p_s13: fx.Pointer, p_xscale: fx.Pointer,
+               M: fx.Int32, sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
+               alim: fx.Float32, p_hbf: fx.Pointer, stream: fx.Stream):
+        gu_role_probe(p_xq, p_w13, p_sid, p_sw, p_seid, p_nv, p_s13, p_xscale, M, sb, sbr, slb,
+                      slbr, alim, p_hbf, value_attrs={"rocdl.waves_per_eu": 2},
+                      ).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
+
     return launch
