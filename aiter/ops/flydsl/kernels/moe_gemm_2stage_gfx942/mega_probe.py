@@ -53,8 +53,9 @@ def build_gu_probe(*, model_dim, inter_dim, topk, experts, mode="8w", stagger=0)
     BN = 128
     NT = N1 // BN
     K = model_dim
-    if mode == "2wg":
-        _os.environ["MOE_GATEUP_MIN_LDS"] = str(30 * 1024)
+    nwg = int(mode[:-2]) if mode.endswith("wg") else 1
+    if nwg in (2, 3):
+        _os.environ["MOE_GATEUP_MIN_LDS"] = str({2: 30 * 1024, 3: 20 * 1024}[nwg])
     gu = compile_moe_gemm1(
         N=N1, K=model_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
         BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=BN, tile_k=128, alg="prefill_1x4", E=experts,
@@ -67,7 +68,8 @@ def build_gu_probe(*, model_dim, inter_dim, topk, experts, mode="8w", stagger=0)
     A_BYTES = 64 * 128  # one A buffer (BM x TILE_K fp8)
     G_BYTES = 2 * A_BYTES
     threads = 512 if mode.startswith("8w") else 256
-    grid = 80 if mode.startswith("8w") else (160 if mode == "2wg" else 320)
+    NOLOOP = _os.environ.get("GU_PROBE_NOLOOP") == "1"
+    grid = 80 if mode.startswith("8w") else 80 * nwg
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def gu_probe(
@@ -106,13 +108,20 @@ def build_gu_probe(*, model_dim, inter_dim, topk, experts, mode="8w", stagger=0)
         else:
             lds = fx.SharedAllocator().allocate(GuStorage)
             b = wg
-            while b < nblk:
+            if const_expr(NOLOOP):
                 for tl in range(NT):
                     gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw, p_seid,
                              p_s13, p_xscale, sb, sbr, slb, slbr, alim, zero64, zero64,
                              sync_before_gemm=True)
                     gpu.barrier()
-                b = b + grid
+            else:
+                while b < nblk:
+                    for tl in range(NT):
+                        gu_block(lds, b, tl, tid, M, xq_view, w13_it, p_hbf, p_sid, p_sw, p_seid,
+                                 p_s13, p_xscale, sb, sbr, slb, slbr, alim, zero64, zero64,
+                                 sync_before_gemm=True)
+                        gpu.barrier()
+                    b = b + grid
 
     @flyc.jit
     def launch(p_xq: fx.Pointer, p_w13: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
@@ -120,7 +129,7 @@ def build_gu_probe(*, model_dim, inter_dim, topk, experts, mode="8w", stagger=0)
                M: fx.Int32, sb: fx.Float32, sbr: fx.Float32, slb: fx.Float32, slbr: fx.Float32,
                alim: fx.Float32, p_hbf: fx.Pointer, stream: fx.Stream):
         gu_probe(p_xq, p_w13, p_sid, p_sw, p_seid, p_nv, p_s13, p_xscale, M, sb, sbr, slb, slbr,
-                 alim, p_hbf, value_attrs={"rocdl.waves_per_eu": 4 if mode == "4wg" else 2},
+                 alim, p_hbf, value_attrs={"rocdl.waves_per_eu": 2 if mode.startswith("8w") else nwg},
                  ).launch(grid=(grid, 1, 1), block=(threads, 1, 1), stream=stream)
 
     return launch

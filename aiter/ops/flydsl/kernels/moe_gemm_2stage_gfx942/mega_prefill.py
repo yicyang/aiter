@@ -11,12 +11,14 @@ The block bodies are the ones the per-block kernels use (gemm1.gateup_prefill_bl
 gemm2_1x4.down_1x4_block), so the output is bit-identical to the separate launches.
 """
 
+import contextlib
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import const_expr, gpu, rocdl
+from flydsl.expr.primitive import PointerType
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -25,6 +27,7 @@ from .. import buffer_ops
 from . import common as fxh
 from .gemm1 import _scf_if_then, compile_moe_gemm1
 from .gemm2_1x4 import _build_moe_gemm2_1x4
+from .gemm2_default import _build_moe_gemm2_default
 
 _XCD = 4  # MI308X: 4 XCDs x 20 CUs
 _GROUP = 8  # consecutive metadata blocks per XCD turn
@@ -56,6 +59,40 @@ def _xcc_id():
     v = llvm.InlineAsmOp(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)", "=s",
                          has_side_effects=True).result
     return fx.Int32(v)
+
+
+
+class _OpaqueTid:
+    """Stands in for gpu.thread_idx while tracing one task body: .x is a copy of the thread
+    index made by a side-effecting v_mov, so address math derived from it cannot be hoisted
+    out of the persistent task loop (where it would stay live and spill across other phases)."""
+
+    def __init__(self, v):
+        self._v = v
+
+    def __getattr__(self, name):
+        if name == "x":
+            return self._v
+        if name in ("y", "z"):
+            return fx.Int32(0)
+        raise AttributeError(name)
+
+
+@contextlib.contextmanager
+def _opaque_thread_idx():
+    import flydsl.expr as _fxm
+    import flydsl.expr.gpu as _gpum
+    saved = _gpum.thread_idx
+    raw = _raw(fx.Int32(saved.x))
+    v = llvm.InlineAsmOp(T.i32, [raw], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True).result
+    o = _OpaqueTid(fx.Int32(v))
+    _gpum.thread_idx = o
+    _fxm.thread_idx = o
+    try:
+        yield
+    finally:
+        _gpum.thread_idx = saved
+        _fxm.thread_idx = saved
 
 
 def _rfl(v):
@@ -1141,7 +1178,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1176,6 +1213,11 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         NT = 1
         _os.environ["MOE_GATEUP_Q_STRIDE"] = str(H_STRIDE)
         _os.environ["MOE_GATEUP_QS_STRIDE"] = str(HS_STRIDE)
+    elif wg3:
+        # 3 WGs per CU (<= 168 VGPR, <= 21.3 KB LDS): gate-up storage padded to the default
+        # down's 20 KB (A and C unioned), which the down task carves from the same base
+        grid = 240
+        _os.environ["MOE_GATEUP_MIN_LDS"] = str(20 * 1024)
     else:
         _os.environ["MOE_GATEUP_MIN_LDS"] = str(30 * 1024)
     gu = compile_moe_gemm1(
@@ -1188,12 +1230,20 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         _os.environ.pop(_k, None)
     _os.environ["MOE_DOWN_A_STRIDE"] = str(H_STRIDE)
     _os.environ["MOE_DOWN_AS_STRIDE"] = str(HS_STRIDE)
-    dn = _build_moe_gemm2_1x4(
-        N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
-        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=256, stage="down", alg="prefill_1x4", E=experts,
-        USE_ATOMIC_WRITE=False, act_quant_type="ptpc", down_path="1x4_64x256",
-        down_output_padding_bytes=0, METADATA_TILE_SIZE_M=64, _store_cache=2,
-    )
+    if wg3:
+        dn = _build_moe_gemm2_default(
+            N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+            BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, stage="down", alg="prefill_1x4",
+            E=experts, USE_ATOMIC_WRITE=False, act_quant_type="ptpc", down_path="default",
+            down_output_padding_bytes=None, METADATA_TILE_SIZE_M=64,
+        )
+    else:
+        dn = _build_moe_gemm2_1x4(
+            N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+            BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=256, stage="down", alg="prefill_1x4", E=experts,
+            USE_ATOMIC_WRITE=False, act_quant_type="ptpc", down_path="1x4_64x256",
+            down_output_padding_bytes=0, METADATA_TILE_SIZE_M=64, _store_cache=2,
+        )
     _os.environ.pop("MOE_DOWN_A_STRIDE", None)
     _os.environ.pop("MOE_DOWN_AS_STRIDE", None)
     gu_block, GuStorage, dn_block = gu.block, gu.storage, dn.block
@@ -1312,6 +1362,10 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             out_row, max_size=False,
             num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
         for i in range(H // 8 // 64):
+            if const_expr(wg3 and i > 0):
+                # keep each slice's 11 row loads (44 VGPRs) from being hoisted together, so the
+                # sum phase stays inside the 168-VGPR budget of 3 WGs per CU
+                rocdl.sched_barrier(0)
             col = (lane + 64 * i) * 8
             frags_i = []
             for k in range(topk):
@@ -1347,11 +1401,18 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
 
         sa = fx.SharedAllocator()
         tick = sa.allocate(fx.Array[fx.Int32, 4, 16]).peek()
-        if const_expr(fuse_sort):
+        if const_expr(fuse_sort and not wg3):
             scan_v = sa.allocate(fx.Array[fx.Int32, 256, 16]).peek().view(fx.make_layout(256, 1))
         lds = sa.allocate(GuStorage)
         tick_v = tick.view(fx.make_layout(4, 1))
         lds_base = fx.recast_iter(fx.Int8, lds.sorted_lds.peek().ptr)
+        if const_expr(fuse_sort and wg3):
+            # 3 WGs per CU: the S2 scan lives in the (then idle) gate-up storage at 16 KB, past
+            # the sort's histogram and per-expert block map; a separate 1 KB array would push the
+            # LDS past 64 KB / 3 once rounded to the allocation granule
+            scan_v = fx.make_view(
+                fx.recast_iter(PointerType.get(fx.Int32.ir_type, lds_base.memspace, 16), lds_base + 16384),
+                fx.make_layout(256, 1))
         ctl = fx.Int64(fx.ptrtoint(p_ctl))
         if const_expr(not fuse_sort):
             nblk = fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0] // 64
@@ -1414,10 +1475,14 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
             _atomic_add(ctl + fx.Int64(16), 1)
         if tid < 64:
+            # bounded: if not all `grid` WGs can be resident (occupancy below target), give up
+            # instead of hanging (results are then wrong; the test reports it)
             creg = _load_volatile(ctl + fx.Int64(16))
-            while creg < grid:
+            reg_it = fx.Int32(0)
+            while (creg < grid) & (reg_it < 2000000):
                 rocdl.s_sleep(1)
                 creg = _load_volatile(ctl + fx.Int64(16))
+                reg_it = reg_it + 1
             if tid == 0:
                 tick_v[1] = _load_volatile(ctl + fx.Int64(xcd * 4))
         gpu.barrier()
@@ -1758,8 +1823,13 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                         _quant_block(b, tid, M, p_sid, p_hbf, i64_h, i64_hs)
                         rocdl.s_waitcnt(0)
                         gpu.barrier()
-                    dn_block(b, p_h, p_w2, p_g2, p_sid, p_sw, p_seid, p_s2, p_hs, M,
-                             _carver(lds_base))
+                    if const_expr(wg3):
+                        with _opaque_thread_idx():
+                            dn_block(b, p_h, p_w2, p_g2, p_sid, p_sw, p_seid, p_s2, p_hs, M,
+                                     _carver(lds_base))
+                    else:
+                        dn_block(b, p_h, p_w2, p_g2, p_sid, p_sw, p_seid, p_s2, p_hs, M,
+                                 _carver(lds_base))
                     if const_expr(prof):
                         if tid == 0:
                             _atomic_add(ctl + fx.Int64(65536 + wg * 32 + 1 * 4), _memtime_lo() - _t2)
@@ -1835,7 +1905,12 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         mega_moe_prefill_v3(
             p_xq, p_w13, p_sid, p_sw, p_seid, p_nv, p_s13, p_xscale, M, sb, sbr, slb, slbr, alim,
             p_h, p_hs, p_w2, p_s2, p_g2, p_ctl, p_hbf, p_par,
-            value_attrs={"rocdl.waves_per_eu": 1 if big_gu else 2},
+            value_attrs=({"rocdl.waves_per_eu": 3, "llvm.passthrough": [["amdgpu-agpr-alloc", "0"]]}
+                         if wg3 else {"rocdl.waves_per_eu": 1 if big_gu else 2}),
         ).launch(grid=(grid, 1, 1), block=(256, 1, 1), stream=stream)
 
+    _lo = _os.environ.get("MEGA_LLVM_OPTS", "")
+    if _lo:
+        # experiment: comma-separated boolean LLVM cl::opts, e.g. disable-machine-licm
+        launch.compile_hints["llvm_options"] = {k: True for k in _lo.split(",") if k}
     return launch
