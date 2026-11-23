@@ -1178,7 +1178,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False, big_gu=False, g_only=False, xcd_group=_GROUP, wg3=False, fast_prefix=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1200,6 +1200,10 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
     G_NOSYNC = _os.environ.get("MEGA_G_NOSYNC") == "1"  # timing probe only
 
     assert not xcd_split or (peer_first and fuse_sort)
+    # fast_prefix: S1 first; the last WG to finish S1 does S2 (no separate registration wait);
+    # x quant runs in 64-token chunks claimed from a ticket while S2 is being computed
+    assert not fast_prefix or (peer_first and fuse_sort and fuse_xq)
+    QT = 106576  # ctl: x-quant chunk ticket (after the DYN_T tickets)
     N1 = 2 * inter_dim
     NT = N1 // gu_bn
     H = model_dim
@@ -1424,7 +1428,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         wg = fx.Int32(gpu.block_idx.x)
 
         _ts0 = _memtime_lo()
-        if const_expr(fuse_xq):
+        if const_expr(fuse_xq and not fast_prefix):
             # phase 0: per-token fp8 quant of x (every WG, one wave per token, written through)
             x_i64 = fx.Int64(_load_i64(par + fx.Int64(64 + 4 * 8)))
             wv = fx.Int32(tid // 64)
@@ -1469,26 +1473,43 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                 vz = vz + 256
             rocdl.s_waitcnt(0)
             gpu.barrier()
+        if const_expr(fast_prefix):
+            # arrive after S1 (release: this WG's histogram adds are done); the last arrival
+            # computes S2. W (WGs per XCD) is read after the S3 sync, when all have arrived.
+            if tid == 0:
+                tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+                _fence(llvm.AtomicOrdering.release)
+                tick_v[2] = _atomic_add(ctl + fx.Int64(16), 1)
+            gpu.barrier()
+            is_s2 = _rfl(_lds_ld_volatile(fx.Int64(fx.ptrtoint(tick.ptr)), 8)) == grid - 1
+            gpu.barrier()  # every wave has read tick[2] before the quant ticket overwrites it
+            if is_s2:
+                if tid == 0:
+                    _fence(llvm.AtomicOrdering.acquire)
+                gpu.barrier()
+                _inv_l1_l2()
+                gpu.barrier()
         # rank within this XCD, then wait for every WG so W (WGs on this XCD) is final (with
         # fuse_xq this is also the grid barrier after phase 0)
-        if tid == 0:
-            tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
-            _atomic_add(ctl + fx.Int64(16), 1)
-        if tid < 64:
-            # bounded: if not all `grid` WGs can be resident (occupancy below target), give up
-            # instead of hanging (results are then wrong; the test reports it)
-            creg = _load_volatile(ctl + fx.Int64(16))
-            reg_it = fx.Int32(0)
-            while (creg < grid) & (reg_it < 2000000):
-                rocdl.s_sleep(1)
-                creg = _load_volatile(ctl + fx.Int64(16))
-                reg_it = reg_it + 1
+        if const_expr(not fast_prefix):
             if tid == 0:
-                tick_v[1] = _load_volatile(ctl + fx.Int64(xcd * 4))
-        gpu.barrier()
-        if const_expr(fuse_xq or fuse_sort):
-            _inv_l1_l2()
+                tick_v[0] = _atomic_add(ctl + fx.Int64(xcd * 4), 1)
+                _atomic_add(ctl + fx.Int64(16), 1)
+            if tid < 64:
+                # bounded: if not all `grid` WGs can be resident (occupancy below target), give
+                # up instead of hanging (results are then wrong; the test reports it)
+                creg = _load_volatile(ctl + fx.Int64(16))
+                reg_it = fx.Int32(0)
+                while (creg < grid) & (reg_it < 2000000):
+                    rocdl.s_sleep(1)
+                    creg = _load_volatile(ctl + fx.Int64(16))
+                    reg_it = reg_it + 1
+                if tid == 0:
+                    tick_v[1] = _load_volatile(ctl + fx.Int64(xcd * 4))
             gpu.barrier()
+            if const_expr(fuse_xq or fuse_sort):
+                _inv_l1_l2()
+                gpu.barrier()
         if const_expr(prof):
             if tid == 0:
                 _atomic_add(ctl + fx.Int64(65536 + 8192 + wg * 16 + 0), _memtime_lo() - _ts0)
@@ -1501,7 +1522,8 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                 # nA = ceil(cA / 64) blocks (all its peer rows) go to region A = [0, nbA), the
                 # rest to region B. Block counts packed as nA + (nB << 16) for one scan.
                 perE = (experts + 255) // 256
-                if wg == 0:
+                s2_here = is_s2 if fast_prefix else (wg == 0)
+                if s2_here:
                     packed = fx.Int32(0)
                     for jj in range(perE):
                         ej = tid * perE + jj
@@ -1590,6 +1612,31 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                     if tid == 0:
                         _fence(llvm.AtomicOrdering.release)
                         _atomic_add(ctl + fx.Int64(SORT_SYNC), grid)
+            if const_expr(fast_prefix):
+                # x quant, 64-token chunks from a ticket (the S2 WG joins once it is done)
+                x_i64 = fx.Int64(_load_i64(par + fx.Int64(64 + 4 * 8)))
+                qtb = fx.Int64(fx.ptrtoint(tick.ptr))
+                if tid == 0:
+                    tick_v[2] = _atomic_add(ctl + fx.Int64(QT), 1)
+                gpu.barrier()
+                qc = _rfl(_lds_ld_volatile(qtb, 8))
+                n_qc = (M + 63) // 64
+                qit = fx.Int32(0)
+                # bounded loop, ticket updated through a select (an LDS ticket used directly as
+                # the loop condition has been miscompiled into a hang before)
+                while (qc < n_qc) & (qit < 65536):
+                    qit = qit + 1
+                    qtok0 = qc * 64 + (tid // 64) * 16
+                    for qq in range(16):
+                        _quant_x_token(qtok0 + qq, tid % 64, M, x_i64, fx.Int64(fx.ptrtoint(p_xq)),
+                                       fx.Int64(fx.ptrtoint(p_xscale)))
+                    gpu.barrier()
+                    if tid == 0:
+                        tick_v[2] = _atomic_add(ctl + fx.Int64(QT), 1)
+                    gpu.barrier()
+                    qc = arith_select(qc < n_qc, _rfl(_lds_ld_volatile(qtb, 8)), qc)
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
             if tid < 64:
                 cs = _load_volatile(ctl + fx.Int64(SORT_SYNC))
                 while cs < grid:
@@ -1718,6 +1765,10 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                     _atomic_add(ctl + fx.Int64(65536 + 8192 + wg * 16 + 8), _memtime_lo() - _ts0)
             nblk = _rfl(_load_volatile(ctl + fx.Int64(SORT_META)))
             nbA = _rfl(_load_volatile(ctl + fx.Int64(SORT_META + 4)))
+            if const_expr(fast_prefix):
+                if tid == 0:
+                    tick_v[1] = _load_volatile(ctl + fx.Int64(xcd * 4))
+                gpu.barrier()
         else:
             nbA = _rfl(p_par[0])
         if const_expr(xcd_split):
