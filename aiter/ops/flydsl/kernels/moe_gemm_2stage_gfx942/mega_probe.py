@@ -133,3 +133,47 @@ def build_gu_probe(*, model_dim, inter_dim, topk, experts, mode="8w", stagger=0)
                  ).launch(grid=(grid, 1, 1), block=(threads, 1, 1), stream=stream)
 
     return launch
+
+
+def build_dn_probe(*, model_dim, inter_dim, topk, experts, nwg=2):
+    """Persistent down (1x4 64x256) over every block of a sort, nwg WGs per CU (256 threads),
+    LDS carved from one 30 KB array like the mega kernel. MOE_DOWN_PREFETCH_TILE=1 enables
+    the full-tile B prefetch (read at build time)."""
+    from .gemm2_1x4 import _build_moe_gemm2_1x4
+    from .mega_prefill import _carver
+
+    dn = _build_moe_gemm2_1x4(
+        N=model_dim, K=inter_dim, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=topk,
+        BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=256, stage="down", alg="prefill_1x4", E=experts,
+        USE_ATOMIC_WRITE=False, act_quant_type="ptpc", down_path="1x4_64x256",
+        down_output_padding_bytes=0, METADATA_TILE_SIZE_M=64, _store_cache=2,
+    )
+    dn_block = dn.block
+    grid = 80 * nwg
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def dn_probe(
+        p_h: fx.Pointer, p_w2: fx.Pointer, p_g2: fx.Pointer, p_sid: fx.Pointer, p_sw: fx.Pointer,
+        p_seid: fx.Pointer, p_nv: fx.Pointer, p_s2: fx.Pointer, p_hs: fx.Pointer, M: fx.Int32,
+    ):
+        wg = fx.Int32(gpu.block_idx.x)
+        nblk = _rfl(fxh.view_as_torch_tensor(p_nv, (1,), fx.Int32)[0] // 64)
+        raw = fx.SharedAllocator().allocate(fx.Array[fx.Int8, 30 * 1024, 16]).peek()
+        base = fx.recast_iter(fx.Int8, raw.ptr)
+        b = wg
+        while b < nblk:
+            dn_block(b, p_h, p_w2, p_g2, p_sid, p_sw, p_seid, p_s2, p_hs, M, _carver(base))
+            gpu.barrier()
+            b = b + grid
+
+    @flyc.jit
+    def launch(p_h: fx.Pointer, p_w2: fx.Pointer, p_g2: fx.Pointer, p_sid: fx.Pointer,
+               p_sw: fx.Pointer, p_seid: fx.Pointer, p_nv: fx.Pointer, p_s2: fx.Pointer,
+               p_hs: fx.Pointer, M: fx.Int32, stream: fx.Stream):
+        dn_probe(p_h, p_w2, p_g2, p_sid, p_sw, p_seid, p_nv, p_s2, p_hs, M,
+                 value_attrs={"rocdl.waves_per_eu": nwg,
+                              "passthrough": [["target-features", "-packed-fp32-ops"]]},
+                 ).launch(grid=(grid, 1, 1), block=(256, 1, 1), stream=stream)
+
+    launch.compile_hints["target_features"] = "-packed-fp32-ops"
+    return launch

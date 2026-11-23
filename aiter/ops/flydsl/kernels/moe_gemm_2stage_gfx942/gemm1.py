@@ -73,6 +73,8 @@ def _build_moe_gemm1(
     QS_STRIDE = int(os.environ.get("MOE_GATEUP_QS_STRIDE", "1"))
     # prefill_1x4 hot loop: MFMAs between consecutive buffer_loads (4 = original schedule)
     VMEM_GAP = int(os.environ.get("MOE_GATEUP_VMEM_GAP", "4"))
+    # prefill_1x4 hot loop prefetch depth in K tiles (2 = original 2-stage loop)
+    PF_DEPTH = int(os.environ.get("MOE_GATEUP_PF_DEPTH", "2"))
     SKIP_PAD_ONE = os.environ.get("MOE_GATEUP_SKIP_PAD_ONE", "0") == "1"
     if FUSE_QUANT:
         assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
@@ -1830,6 +1832,50 @@ def _build_moe_gemm1(
                 hot_loop_scheduler()
             rocdl.sched_barrier(0)
             gpu.barrier()
+
+        if const_expr(PF_DEPTH > 2):
+            # Deep prefetch, K loop fully unrolled: B in a ring of PF_DEPTH register slots, A
+            # staged through a ring of PF_DEPTH-1 register slots (then the LDS ping-pong). The
+            # loads of tile k+D-1 are issued at the head of stage k; waits come from the
+            # register data dependences. Same MFMA order as the 2-stage loop (bit-exact).
+            D = PF_DEPTH
+            bl_ring = [tiled_mma.make_fragment_A(bl_tile[None, None, 0]) for _ in range_constexpr(D)]
+            br_ring = [tiled_mma.make_fragment_A(br_tile[None, None, 0]) for _ in range_constexpr(D)]
+            bl_ring_ret = [b_g2r.retile(f) for f in bl_ring]
+            br_ring_ret = [b_g2r.retile(f) for f in br_ring]
+            a_ring = [fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range_constexpr(D - 1)]
+            a_ring_ret = [a_r2s.get_slice(tid).retile(f) for f in a_ring]
+
+            def issue(kt):
+                a_idx.copy(buf_cp_atom_r, fx.Int32(kt), a_ring[kt % (D - 1)])
+                fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(kt)], bl_ring_ret[kt % D])
+                fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(kt)], br_ring_ret[kt % D])
+
+            for kt in range_constexpr(min(D - 1, num_tiles)):
+                issue(kt)
+            fx.copy(uni_cp_atom, a_ring_ret[0], a_lds_w[0])
+            gpu.barrier()
+            for kt in range_constexpr(num_tiles):
+                if const_expr(kt + D - 1 < num_tiles):
+                    issue(kt + D - 1)
+                for ki in range_constexpr(k_iters):
+                    fx.copy(uni_cp_atom, a_lds_r[kt % 2][None, None, ki], a_frag_retile[None, None, ki])
+                    for n in range_constexpr(_n_act):
+                        for m in range_constexpr(_m_reps):
+                            for k in range_constexpr(2):
+                                fx.mma_atom_call(mma_atom, c_gate[None, m, n],
+                                                 bl_ring[kt % D][None, m, (k, ki)],
+                                                 a_frag[None, n, (k, ki)], c_gate[None, m, n])
+                                fx.mma_atom_call(mma_atom, c_up[None, m, n],
+                                                 br_ring[kt % D][None, m, (k, ki)],
+                                                 a_frag[None, n, (k, ki)], c_up[None, m, n])
+                if const_expr(kt + 1 < num_tiles):
+                    fx.copy(uni_cp_atom, a_ring_ret[(kt + 1) % (D - 1)], a_lds_w[(kt + 1) % 2])
+                    if const_expr(kt + D - 1 < num_tiles):
+                        hot_loop_scheduler()
+                rocdl.sched_barrier(0)
+                gpu.barrier()
+            return c_gate, c_up
 
         # Prologue: gather A(0) -> LDS[0]; load B(0) -> stage 0.
         a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
