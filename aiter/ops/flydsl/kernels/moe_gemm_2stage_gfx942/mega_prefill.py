@@ -1141,7 +1141,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1415,38 +1415,84 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
         if const_expr(fuse_sort):
             NV = 2 * experts
             per = (NV + 255) // 256
-            # S2 (WG 0): padded block offsets, nblk, nbA
-            if wg == 0:
-                loc_blocks = fx.Int32(0)
-                for jj in range(per):
-                    vj = tid * per + jj
-                    cj = arith_select(vj < NV, _load_volatile(ctl + fx.Int64(SORT_HIST + vj * 4)), 0)
-                    loc_blocks = loc_blocks + (cj + 63) // 64
-                scan_v[tid] = loc_blocks
-                gpu.barrier()
-                if tid == 0:
-                    acc = fx.Int32(0)
-                    accA = fx.Int32(0)
-                    for ii in range(256):
-                        cur_ii = scan_v[ii]
-                        scan_v[ii] = acc
-                        acc = acc + cur_ii
-                    _atomic_add(ctl + fx.Int64(SORT_META), acc)
-                gpu.barrier()
-                run = scan_v[tid]
-                nbA_part = fx.Int32(0)
-                for jj in range(per):
-                    vj = tid * per + jj
-                    cj = arith_select(vj < NV, _load_volatile(ctl + fx.Int64(SORT_HIST + vj * 4)), 0)
-                    _atomic_add(ctl + fx.Int64(SORT_OFF + vj * 4), arith_select(vj < NV, run, 0))
-                    nbA_part = nbA_part + arith_select(vj < experts, (cj + 63) // 64, 0)
-                    run = run + (cj + 63) // 64
-                _atomic_add(ctl + fx.Int64(SORT_META + 4), nbA_part)
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
-                if tid == 0:
-                    _fence(llvm.AtomicOrdering.release)
-                    _atomic_add(ctl + fx.Int64(SORT_SYNC), grid)
+            if const_expr(peer_first):
+                # S2 (WG 0), 1E layout with peer rows first inside each expert: expert e has
+                # nb = ceil((cA + cB) / 64) blocks (padding only at its end); its first
+                # nA = ceil(cA / 64) blocks (all its peer rows) go to region A = [0, nbA), the
+                # rest to region B. Block counts packed as nA + (nB << 16) for one scan.
+                perE = (experts + 255) // 256
+                if wg == 0:
+                    packed = fx.Int32(0)
+                    for jj in range(perE):
+                        ej = tid * perE + jj
+                        cAj = arith_select(ej < experts, _load_volatile(ctl + fx.Int64(SORT_HIST + ej * 4)), 0)
+                        cBj = arith_select(ej < experts, _load_volatile(ctl + fx.Int64(SORT_HIST + (experts + ej) * 4)), 0)
+                        nAj = (cAj + 63) // 64
+                        packed = packed + nAj + (((cAj + cBj + 63) // 64 - nAj) << 16)
+                    scan_v[tid] = packed
+                    gpu.barrier()
+                    if tid == 0:
+                        acc = fx.Int32(0)
+                        for ii in range(256):
+                            cur_ii = scan_v[ii]
+                            scan_v[ii] = acc
+                            acc = acc + cur_ii
+                        tick_v[3] = acc
+                        _atomic_add(ctl + fx.Int64(SORT_META), (acc & 0xFFFF) + (acc >> 16))
+                        _atomic_add(ctl + fx.Int64(SORT_META + 4), acc & 0xFFFF)
+                    gpu.barrier()
+                    run = scan_v[tid]
+                    totA = tick_v[3] & 0xFFFF
+                    for jj in range(perE):
+                        ej = tid * perE + jj
+                        cAj = arith_select(ej < experts, _load_volatile(ctl + fx.Int64(SORT_HIST + ej * 4)), 0)
+                        cBj = arith_select(ej < experts, _load_volatile(ctl + fx.Int64(SORT_HIST + (experts + ej) * 4)), 0)
+                        nAj = (cAj + 63) // 64
+                        nBj = (cAj + cBj + 63) // 64 - nAj
+                        # off[e] = first A block; off[E + e] = (first B block) - nA, so the
+                        # physical block of logical block j is off[e or E + e] + j
+                        _atomic_add(ctl + fx.Int64(SORT_OFF + ej * 4), arith_select(ej < experts, run & 0xFFFF, 0))
+                        _atomic_add(ctl + fx.Int64(SORT_OFF + (experts + ej) * 4),
+                                    arith_select(ej < experts, totA + (run >> 16) - nAj, 0))
+                        run = run + nAj + (nBj << 16)
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()
+                    if tid == 0:
+                        _fence(llvm.AtomicOrdering.release)
+                        _atomic_add(ctl + fx.Int64(SORT_SYNC), grid)
+            else:
+                # S2 (WG 0): padded block offsets, nblk, nbA
+                if wg == 0:
+                    loc_blocks = fx.Int32(0)
+                    for jj in range(per):
+                        vj = tid * per + jj
+                        cj = arith_select(vj < NV, _load_volatile(ctl + fx.Int64(SORT_HIST + vj * 4)), 0)
+                        loc_blocks = loc_blocks + (cj + 63) // 64
+                    scan_v[tid] = loc_blocks
+                    gpu.barrier()
+                    if tid == 0:
+                        acc = fx.Int32(0)
+                        accA = fx.Int32(0)
+                        for ii in range(256):
+                            cur_ii = scan_v[ii]
+                            scan_v[ii] = acc
+                            acc = acc + cur_ii
+                        _atomic_add(ctl + fx.Int64(SORT_META), acc)
+                    gpu.barrier()
+                    run = scan_v[tid]
+                    nbA_part = fx.Int32(0)
+                    for jj in range(per):
+                        vj = tid * per + jj
+                        cj = arith_select(vj < NV, _load_volatile(ctl + fx.Int64(SORT_HIST + vj * 4)), 0)
+                        _atomic_add(ctl + fx.Int64(SORT_OFF + vj * 4), arith_select(vj < NV, run, 0))
+                        nbA_part = nbA_part + arith_select(vj < experts, (cj + 63) // 64, 0)
+                        run = run + (cj + 63) // 64
+                    _atomic_add(ctl + fx.Int64(SORT_META + 4), nbA_part)
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()
+                    if tid == 0:
+                        _fence(llvm.AtomicOrdering.release)
+                        _atomic_add(ctl + fx.Int64(SORT_SYNC), grid)
             if tid < 64:
                 cs = _load_volatile(ctl + fx.Int64(SORT_SYNC))
                 while cs < grid:
@@ -1464,42 +1510,99 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             seid_w = fx.Int64(fx.ptrtoint(p_seid))
             loc_w = fx.Int64(_load_i64(par + fx.Int64(64 + 7 * 8)))  # loc base (all routes)
             gt = wg * 256 + tid
-            vv2 = gt
-            while vv2 < NV:
-                c2 = _load_volatile(ctl + fx.Int64(SORT_HIST + vv2 * 4))
-                o2 = _load_volatile(ctl + fx.Int64(SORT_OFF + vv2 * 4))
-                nb2 = (c2 + 63) // 64
-                jb = fx.Int32(0)
-                while jb < nb2:
-                    _store_wt(seid_w + fx.Int64((o2 + jb) * 4), vv2 % experts)
-                    jb = jb + 1
-                pp = o2 * 64 + c2
-                while pp < (o2 + nb2) * 64:
-                    _store_wt(sid_w + fx.Int64(pp * 4), M | (topk << 24))
-                    _store_wt(sw_w + fx.Int64(pp * 4), 0)
-                    pp = pp + 1
-                vv2 = vv2 + grid * 256
-            w_p = par_ptr(6, T.f32)
-            # S3: reserve this WG's range per expert (one global atomic per non-empty bin),
-            # then place each route with an LDS cursor
-            vz = tid
-            while vz < NV:
-                ch = _lds_ld(lb, vz * 4)
-                if ch > 0:
-                    o3 = _load_volatile(ctl + fx.Int64(SORT_OFF + vz * 4))
-                    _lds_st(lb, vz * 4, o3 * 64 + _atomic_add(ctl + fx.Int64(SORT_CUR + vz * 4), ch))
-                vz = vz + 256
-            gpu.barrier()
-            rr = rc0 + tid
-            while rr < rc1:
-                tk = rr // topk
-                sl = rr - tk * topk
-                vv = ids_p[rr] + experts * arith_select((tk >= own_lo) & (tk < own_lo + own_n), 1, 0)
-                pos = _lds_add(lb, vv * 4, 1)
-                _store_wt(sid_w + fx.Int64(pos * 4), tk | (sl << 24))
-                _store_wt(sw_w + fx.Int64(pos * 4), fx.Int32(w_p[rr].bitcast(fx.Int32)))
-                _store_wt(loc_w + fx.Int64(rr * 4), pos)
-                rr = rr + 256
+            if const_expr(peer_first):
+                MOFF = 8192  # LDS per-expert [offA | offB' | nA] after the 2E histogram
+                ez2 = gt
+                while ez2 < experts:
+                    pcA = _load_volatile(ctl + fx.Int64(SORT_HIST + ez2 * 4))
+                    pcB = _load_volatile(ctl + fx.Int64(SORT_HIST + (experts + ez2) * 4))
+                    pA = _load_volatile(ctl + fx.Int64(SORT_OFF + ez2 * 4))
+                    pB = _load_volatile(ctl + fx.Int64(SORT_OFF + (experts + ez2) * 4))
+                    pnA = (pcA + 63) // 64
+                    pnb = (pcA + pcB + 63) // 64
+                    pj = fx.Int32(0)
+                    while pj < pnb:
+                        _store_wt(seid_w + fx.Int64((arith_select(pj < pnA, pA, pB) + pj) * 4), ez2)
+                        pj = pj + 1
+                    pq = pcA + pcB
+                    while pq < pnb * 64:
+                        pjl = pq // 64
+                        ppos = (arith_select(pjl < pnA, pA, pB) + pjl) * 64 + pq - pjl * 64
+                        _store_wt(sid_w + fx.Int64(ppos * 4), M | (topk << 24))
+                        _store_wt(sw_w + fx.Int64(ppos * 4), 0)
+                        pq = pq + 1
+                    ez2 = ez2 + grid * 256
+                w_p = par_ptr(6, T.f32)
+                # S3: reserve this WG's rank range per bin (peer ranks from 0, own ranks
+                # from cA), stage the per-expert block map in LDS, then place each route
+                qz = tid
+                while qz < NV:
+                    qch = _lds_ld(lb, qz * 4)
+                    if qch > 0:
+                        qbase = _atomic_add(ctl + fx.Int64(SORT_CUR + qz * 4), qch) + arith_select(
+                            qz >= experts, _load_volatile(ctl + fx.Int64(SORT_HIST + (qz - experts) * 4)), 0)
+                        _lds_st(lb, qz * 4, qbase)
+                    qz = qz + 256
+                qe = tid
+                while qe < experts:
+                    _lds_st(lb, MOFF + qe * 4, _load_volatile(ctl + fx.Int64(SORT_OFF + qe * 4)))
+                    _lds_st(lb, MOFF + 2560 + qe * 4, _load_volatile(ctl + fx.Int64(SORT_OFF + (experts + qe) * 4)))
+                    _lds_st(lb, MOFF + 5120 + qe * 4,
+                            (_load_volatile(ctl + fx.Int64(SORT_HIST + qe * 4)) + 63) // 64)
+                    qe = qe + 256
+                gpu.barrier()
+                qr = rc0 + tid
+                while qr < rc1:
+                    qtk = qr // topk
+                    qsl = qr - qtk * topk
+                    qid = ids_p[qr]
+                    qv = qid + experts * arith_select((qtk >= own_lo) & (qtk < own_lo + own_n), 1, 0)
+                    qrow = _lds_add(lb, qv * 4, 1)
+                    qjl = qrow // 64
+                    qob = arith_select(qjl < _lds_ld(lb, MOFF + 5120 + qid * 4),
+                                       _lds_ld(lb, MOFF + qid * 4), _lds_ld(lb, MOFF + 2560 + qid * 4))
+                    qpos = (qob + qjl) * 64 + qrow - qjl * 64
+                    _store_wt(sid_w + fx.Int64(qpos * 4), qtk | (qsl << 24))
+                    _store_wt(sw_w + fx.Int64(qpos * 4), fx.Int32(w_p[qr].bitcast(fx.Int32)))
+                    _store_wt(loc_w + fx.Int64(qr * 4), qpos)
+                    qr = qr + 256
+            else:
+                vv2 = gt
+                while vv2 < NV:
+                    c2 = _load_volatile(ctl + fx.Int64(SORT_HIST + vv2 * 4))
+                    o2 = _load_volatile(ctl + fx.Int64(SORT_OFF + vv2 * 4))
+                    nb2 = (c2 + 63) // 64
+                    jb = fx.Int32(0)
+                    while jb < nb2:
+                        _store_wt(seid_w + fx.Int64((o2 + jb) * 4), vv2 % experts)
+                        jb = jb + 1
+                    pp = o2 * 64 + c2
+                    while pp < (o2 + nb2) * 64:
+                        _store_wt(sid_w + fx.Int64(pp * 4), M | (topk << 24))
+                        _store_wt(sw_w + fx.Int64(pp * 4), 0)
+                        pp = pp + 1
+                    vv2 = vv2 + grid * 256
+                w_p = par_ptr(6, T.f32)
+                # S3: reserve this WG's range per expert (one global atomic per non-empty bin),
+                # then place each route with an LDS cursor
+                vz = tid
+                while vz < NV:
+                    ch = _lds_ld(lb, vz * 4)
+                    if ch > 0:
+                        o3 = _load_volatile(ctl + fx.Int64(SORT_OFF + vz * 4))
+                        _lds_st(lb, vz * 4, o3 * 64 + _atomic_add(ctl + fx.Int64(SORT_CUR + vz * 4), ch))
+                    vz = vz + 256
+                gpu.barrier()
+                rr = rc0 + tid
+                while rr < rc1:
+                    tk = rr // topk
+                    sl = rr - tk * topk
+                    vv = ids_p[rr] + experts * arith_select((tk >= own_lo) & (tk < own_lo + own_n), 1, 0)
+                    pos = _lds_add(lb, vv * 4, 1)
+                    _store_wt(sid_w + fx.Int64(pos * 4), tk | (sl << 24))
+                    _store_wt(sw_w + fx.Int64(pos * 4), fx.Int32(w_p[rr].bitcast(fx.Int32)))
+                    _store_wt(loc_w + fx.Int64(rr * 4), pos)
+                    rr = rr + 256
             rocdl.s_waitcnt(0)
             gpu.barrier()
             if tid == 0:
