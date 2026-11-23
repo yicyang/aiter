@@ -1141,7 +1141,7 @@ def build_mega_prefill_seg(*, model_dim, inter_dim, topk, experts, grid=80, stor
 @functools.lru_cache(maxsize=8)
 def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_bn=128,
                           push=False, prof=False, fuse_xq=False, fuse_sort=False,
-                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False):
+                          skip_pad=False, sa_delay=0, dyn=False, peer_first=False, xcd_split=False):
     """Persistent prefill MoE, 2 WGs per CU (all bodies <= 256 VGPR, <= 30 KB LDS).
 
     Per XCD (the blocks b with (b // 8) % 4 == xcd) the task sequence is
@@ -1159,6 +1159,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
     """
     import os as _os
 
+    assert not xcd_split or (peer_first and fuse_sort)
     N1 = 2 * inter_dim
     NT = N1 // gu_bn
     H = model_dim
@@ -1278,6 +1279,7 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
 
     SORT_HIST, SORT_CUR, SORT_OFF = 81920, 90112, 98304  # ctl byte offsets (2E bins each)
     SORT_META, SORT_SYNC = 106496, 106512  # [nblk, nbA], [sync after S2, sync after S3]
+    SORT_XR = 106528  # xcd_split: [first A block of XCD x] x4, [first B block of XCD x] x4
 
     def _sum_tokens(chunk, tid, M, p_loc, p_g2, p_out, wt):
         # moe_reduce.sorted_sum's math and order; one wave per token, 4 tokens per call.
@@ -1454,7 +1456,24 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
                         _atomic_add(ctl + fx.Int64(SORT_OFF + ej * 4), arith_select(ej < experts, run & 0xFFFF, 0))
                         _atomic_add(ctl + fx.Int64(SORT_OFF + (experts + ej) * 4),
                                     arith_select(ej < experts, totA + (run >> 16) - nAj, 0))
+                        if const_expr(xcd_split):
+                            # XCD x takes logical blocks [x*nblk/4, (x+1)*nblk/4) of the
+                            # expert-ordered sequence; its A and B blocks are then one range
+                            # each. Record where boundary g falls inside expert ej.
+                            tPre = (run & 0xFFFF) + (run >> 16)
+                            nblk_t = (tick_v[3] & 0xFFFF) + (tick_v[3] >> 16)
+                            for xb in range(1, _XCD):
+                                gq = xb * nblk_t // _XCD
+                                hit = (ej < experts) & (gq >= tPre) & (gq < tPre + nAj + nBj)
+                                j0 = gq - tPre
+                                _atomic_add(ctl + fx.Int64(SORT_XR + xb * 4),
+                                            arith_select(hit, (run & 0xFFFF) + arith_min(j0, nAj), 0))
+                                _atomic_add(ctl + fx.Int64(SORT_XR + 16 + xb * 4),
+                                            arith_select(hit, totA + (run >> 16) - nAj + arith_max(j0, nAj), 0))
                         run = run + nAj + (nBj << 16)
+                    if const_expr(xcd_split):
+                        if tid == 0:
+                            _atomic_add(ctl + fx.Int64(SORT_XR + 16), totA)
                     rocdl.s_waitcnt(0)
                     gpu.barrier()
                     if tid == 0:
@@ -1623,12 +1642,21 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             nbA = _rfl(_load_volatile(ctl + fx.Int64(SORT_META + 4)))
         else:
             nbA = _rfl(p_par[0])
-        full_groups = nblk // (_XCD * _GROUP)
-        rem = nblk - full_groups * (_XCD * _GROUP)
-        n_x = full_groups * _GROUP + fx.Int32(arith_min(arith_max(rem - xcd * _GROUP, 0), _GROUP))
-        fgA = nbA // (_XCD * _GROUP)
-        remA = nbA - fgA * (_XCD * _GROUP)
-        nA_x = fgA * _GROUP + fx.Int32(arith_min(arith_max(remA - xcd * _GROUP, 0), _GROUP))
+        if const_expr(xcd_split):
+            xa0 = _rfl(_load_volatile(ctl + fx.Int64(SORT_XR + xcd * 4)))
+            xb0 = _rfl(_load_volatile(ctl + fx.Int64(SORT_XR + 16 + xcd * 4)))
+            xnext = arith_min(xcd + 1, _XCD - 1)
+            xa1 = _rfl(arith_select(xcd == _XCD - 1, nbA, _load_volatile(ctl + fx.Int64(SORT_XR + xnext * 4))))
+            xb1 = _rfl(arith_select(xcd == _XCD - 1, nblk, _load_volatile(ctl + fx.Int64(SORT_XR + 16 + xnext * 4))))
+            nA_x = xa1 - xa0
+            n_x = nA_x + xb1 - xb0
+        else:
+            full_groups = nblk // (_XCD * _GROUP)
+            rem = nblk - full_groups * (_XCD * _GROUP)
+            n_x = full_groups * _GROUP + fx.Int32(arith_min(arith_max(rem - xcd * _GROUP, 0), _GROUP))
+            fgA = nbA // (_XCD * _GROUP)
+            remA = nbA - fgA * (_XCD * _GROUP)
+            nA_x = fgA * _GROUP + fx.Int32(arith_min(arith_max(remA - xcd * _GROUP, 0), _GROUP))
         n_tasks = 2 * n_x
         T_A = arith_select(nA_x == 0, -1, n_x + nA_x - 1)  # this queue's last A down
         if const_expr(dyn):
@@ -1702,7 +1730,10 @@ def build_mega_prefill_v3(*, model_dim, inter_dim, topk, experts, grid=160, gu_b
             if t < n_tasks:
                 is_down = t >= n_x
                 loc = arith_select(is_down, t - n_x, t)
-                b = (loc // _GROUP) * (_XCD * _GROUP) + xcd * _GROUP + loc % _GROUP
+                if const_expr(xcd_split):
+                    b = arith_select(loc < nA_x, xa0 + loc, xb0 + loc - nA_x)
+                else:
+                    b = (loc // _GROUP) * (_XCD * _GROUP) + xcd * _GROUP + loc % _GROUP
                 if is_down:
                     if tid < 64:
                         cg = _load_volatile(ctl + fx.Int64(64 + b * 4))
