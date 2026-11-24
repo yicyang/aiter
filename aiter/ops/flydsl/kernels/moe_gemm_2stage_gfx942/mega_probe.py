@@ -568,26 +568,26 @@ def build_sum_probe(*, hidden, topk, fp8=False, grid=160):
         while ch < ch1:
             tok = ch * 4 + tid // 64
             tok_c = arith_min(tok, M - 1)
-            locs = [p_loc[tok_c * topk + k] for k in range(topk)]
+            locs = [p_loc[tok_c * topk + k] for k in range_constexpr(topk)]
             valid = [loc >= 0 for loc in locs]
             g2 = fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_g2))
-            rows = [g2 + fx.Int64(valid[k].select(locs[k], 0)) * H for k in range(topk)]
+            rows = [g2 + fx.Int64(valid[k].select(locs[k], 0)) * H for k in range_constexpr(topk)]
             copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
             copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy(128, cache_modifier=17), fx.BFloat16)
             out_row = fx.make_view(fx.recast_iter(fx.BFloat16, fxh._as_ptr(p_out)) + fx.Int64(tok) * H,
                                    fx.make_layout(H, 1))
             out_buf = fx.rocdl.make_buffer_tensor(
                 out_row, max_size=False, num_records_bytes=(tok < M).select(fx.Int32(H * 2), fx.Int32(0)))
-            for i in range(H // 8 // 64):
+            for i in range_constexpr(H // 8 // 64):
                 col = (lane + 64 * i) * 8
                 frags_i = []
-                for k in range(topk):
+                for k in range_constexpr(topk):
                     atom = fx.make_view(rows[k] + col, fx.make_layout(8, 1))
                     frag = fx.make_fragment_like(atom)
                     fx.copy(copy_atom, atom, frag)
                     frags_i.append(frag)
                 acc = valid[0].select(frags_i[0].load().to(fx.Float32), 0.0)
-                for k in range(1, topk):
+                for k in range_constexpr(1, topk):
                     acc += valid[k].select(frags_i[k].load().to(fx.Float32), 0.0)
                 if const_expr(fp8):
                     records(acc, lane, tok, M, col, rec_rsrc)
