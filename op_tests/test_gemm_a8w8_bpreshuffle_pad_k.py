@@ -586,6 +586,82 @@ def test_gemm_a8w8_bpreshuffle_flydsl_ck_fallback_strided_scales(
     assert err == 0, err
 
 
+# ── gfx942 C-shuffle epilogue (opt-in "_cs" kernelName token) ─────────────
+
+
+@pytest.mark.parametrize(
+    "suffix, scheduler, k_split, cshuffle",
+    [
+        ("", "Default", 1, False),
+        ("_cs", "Default", 1, True),
+        ("_default_cs", "default", 1, True),
+        ("_off", "off", 1, False),
+        ("_default_ks7", "default", 7, False),
+        ("_ks7", "Default", 7, False),
+    ],
+)
+def test_flydsl_kernel_name_cshuffle_token(suffix, scheduler, k_split, cshuffle):
+    name = f"flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2{suffix}"
+    parsed = gemm_mod._parse_flydsl_kernel_name(name)
+    assert parsed == (64, 256, 128, 0, 2, 0, 2, scheduler, k_split, cshuffle)
+
+
+@pytest.mark.parametrize("suffix, cshuffle", [("", False), ("_cs", True)])
+def test_flydsl_bpreshuffle_row_selects_cshuffle(monkeypatch, suffix, cshuffle):
+    from aiter.ops.flydsl import gemm_kernels
+
+    seen = {}
+
+    def fake_flydsl(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx942")
+    monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
+    row = {
+        "libtype": "flydsl",
+        "splitK": 0,
+        "kernelName": f"flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2{suffix}",
+    }
+    m, n, k = 64, 2560, 3072
+    xq = torch.empty((m, k), device="meta", dtype=dtypes.fp8)
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    scales = [torch.empty((r, 1), device="meta") for r in (m, n)]
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, *scales, out, row)
+    assert seen["cshuffle"] is cshuffle
+
+
+# Qwen3.8-Flash-Next TP2 prefill GEMMs (N, K) with aligned and ragged M.
+_CSHUFFLE_CASES = [
+    (m, n, k)
+    for n, k in ((2560, 3072), (6656, 2560), (8192, 2560))
+    for m in (1, 17, 100, 1152, 2496)
+]
+
+
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="C-shuffle epilogue is gfx942-only")
+@pytest.mark.parametrize("waves_per_eu", [0, 2])
+@pytest.mark.parametrize("m, n, k", _CSHUFFLE_CASES)
+def test_flydsl_preshuffle_cshuffle_bit_identical(m, n, k, waves_per_eu):
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    torch.manual_seed(0)
+    xq = (torch.randn(m, k) * 0.5).to(dtypes.fp8)
+    wq = shuffle_weight((torch.randn(n, k) * 0.5).to(dtypes.fp8), layout=(16, 16))
+    x_scale = torch.rand(m, 1) * 0.02 + 0.001
+    w_scale = torch.rand(n, 1) * 0.02 + 0.001
+    outs = []
+    for cshuffle in (False, True):
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16)
+        flydsl_preshuffle_gemm_a8(
+            xq, wq, x_scale, w_scale, out, 64, 256, 128, 0, waves_per_eu,
+            cshuffle=cshuffle,
+        )
+        outs.append(out)
+    assert not torch.isnan(outs[1]).any()
+    assert torch.equal(outs[0], outs[1])
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -637,4 +713,6 @@ if __name__ == "__main__":
     main()
     # CI runs this file with python3, which skips its pytest functions; run the
     # FlyDSL-to-CK fallback checks here so CI exercises them.
-    sys.exit(pytest.main([__file__, "-q", "-k", "falls_back or ck_fallback"]))
+    sys.exit(
+        pytest.main([__file__, "-q", "-k", "falls_back or ck_fallback or cshuffle"])
+    )
