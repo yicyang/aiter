@@ -567,8 +567,13 @@ def flydsl_preshuffle_gemm_a8(
     lds_stage: int = 2,
     enable_scheduler: bool = True,
     split_k: int = 1,
+    cshuffle: bool = False,
 ) -> Tensor:
-    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
+    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K.
+
+    ``cshuffle`` selects the gfx942 C-shuffle epilogue (see
+    ``compile_preshuffle_gemm``); tuned rows opt in with a ``_cs`` kernelName token.
+    """
     from aiter.utility import dtypes
 
     m, k = XQ.shape[0], XQ.shape[-1]
@@ -639,6 +644,7 @@ def flydsl_preshuffle_gemm_a8(
         "xcd_swizzle": int(xcd_swizzle),
         "lds_stage": int(lds_stage),
         "split_k": int(split_k),
+        "cshuffle": bool(cshuffle),
     }
 
     def _as_i8(t):

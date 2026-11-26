@@ -155,16 +155,17 @@ def _ck_bpreshuffle_output_fits(m: int, n: int, out_elem_bytes: int) -> bool:
 @functools.cache
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
-    waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split)``, or None on
-    failure. Legacy names lacking the xcd/lds/scheduler tokens default them to
-    ``0``/``2``/``"Default"``; the ``_ksN`` split-K suffix is only emitted for
-    k_split > 1, so every previously tuned name still parses to k_split=1.
+    waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split, cshuffle)``, or
+    None on failure. Legacy names lacking the xcd/lds/scheduler tokens default
+    them to ``0``/``2``/``"Default"``; the ``_ksN`` split-K suffix is only
+    emitted for k_split > 1, so every previously tuned name still parses to
+    k_split=1. A ``_cs`` token opts the row into the gfx942 C-shuffle epilogue.
     """
     import re
 
     m = re.match(
         r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?"
-        r"(?:_(?!ks\d+$)([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?$",
+        r"(?:_(?!ks\d+$|cs(?:_ks\d+)?$)([A-Za-z][A-Za-z0-9]*))?(?:_(cs))?(?:_ks(\d+))?$",
         kernel_name,
     )
     if m is None:
@@ -173,8 +174,9 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     xcd_swizzle = int(m.group(6)) if m.group(6) else 0
     lds_stage = int(m.group(7)) if m.group(7) else 2
     scheduler = m.group(8) if m.group(8) else "Default"
-    k_split = int(m.group(9)) if m.group(9) else 1
-    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
+    cshuffle = m.group(9) is not None
+    k_split = int(m.group(10)) if m.group(10) else 1
+    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split, cshuffle)
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -215,7 +217,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split, cshuffle = parsed
     # The launcher raises for M > PRESHUFFLE_M_MAX (the padded-M lookup serves
     # every M > 8192 with the M=8192 row when N > 4096) and for a K the tuned
     # split-K or tile_k does not divide (e.g. _ks7 on K=7168 padded to 8192).
@@ -253,6 +255,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         lds_stage=lds_stage,
         enable_scheduler=str(scheduler).lower() != "off",
         split_k=k_split,
+        cshuffle=cshuffle,
     )
     return Out
 
