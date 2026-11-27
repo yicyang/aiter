@@ -111,7 +111,7 @@ def pr_c():
     box(ax, 21.8, 6.3, 3.4, 1.6, "chunked\ndelta rule", DATA, EDGE_D, 9)
     for x0, x1 in ((3.3, 4.2), (8.8, 9.7), (12.3, 13.2), (16.6, 17.5), (20.9, 21.8)):
         arrow(ax, x0, 7.1, x1, 7.1)
-    ax.text(25.6, 7.1, "321.9 us", ha="left", va="center", fontsize=10, color=INK, weight="bold")
+    ax.text(25.6, 7.1, "323.6 us", ha="left", va="center", fontsize=10, color=INK, weight="bold")
     ax.text(10.9, 5.9, "q, k written and read back twice", ha="center", fontsize=8, color=EDGE_H)
 
     ax.text(0.3, 4.6, "After: 1 launch", fontsize=10, color=MUTED)
@@ -119,12 +119,12 @@ def pr_c():
     box(ax, 4.2, 2.1, 16.7, 2.0,
         "flydsl_gdn_prefill_front  (one workgroup per head x 128-token chunk x sequence)\n"
         "16-byte row loads + 3-token halo in registers  ->  conv(4) + SiLU  ->  split\n"
-        "->  q/k L2 norm with a 16-lane DPP all-reduce (no LDS)  ->  q, k, v  |  conv state written in place",
+        "->  L2 norm on q/k heads (16-lane DPP; v heads skip it)  ->  q, k, v  |  conv state in place",
         FUSED, EDGE_F, 9)
     box(ax, 21.8, 2.3, 3.4, 1.6, "chunked\ndelta rule\n(l2norm off)", DATA, EDGE_D, 9)
     arrow(ax, 3.3, 3.1, 4.2, 3.1)
     arrow(ax, 20.9, 3.1, 21.8, 3.1)
-    ax.text(25.6, 3.1, "255.3 us\n(-21%)", ha="left", va="center", fontsize=10, color=EDGE_F, weight="bold")
+    ax.text(25.6, 3.1, "227.0 us\n(-30%)", ha="left", va="center", fontsize=10, color=EDGE_F, weight="bold")
     ax.text(0.3, 0.6, "MI308X (gfx942, 80 CU), cold L2/MALL, median kernel time. gfx942 + Qwen3.8 TP1/TP2 heads (16/48, 8/24) only; "
             "TP4, other archs and models keep their path.", fontsize=8, color=MUTED)
     fig.savefig(f"{OUT}/pr-c-gdn-prefill-front-fusion.png", bbox_inches="tight", facecolor="white")
